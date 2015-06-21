@@ -2,3 +2,7 @@
 name = "ddp"
 version = "0.1.0"
 authors = ["Michael Eden <themichaeleden@gmail.com>"]
+
+[dependencies]
+websocket = "0.12.1"
+rustc-serialize = "0.3.15"
