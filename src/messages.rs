@@ -33,6 +33,12 @@ pub struct Pong {
     pub id:  Option<String>,
 }
 
+#[derive(RustcEncodable)]
+pub struct Method<'l> {
+    pub method: &'l str,
+    pub params: Option<&'l [&'l str]>,
+}
+
 impl Connect {
     pub fn new(version: &'static str) -> Self {
         Connect {

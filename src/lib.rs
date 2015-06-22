@@ -1,11 +1,13 @@
 extern crate rustc_serialize;
 extern crate websocket;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::mpsc::channel;
+use std::sync::mpsc::Sender as AtomicSender;
 use std::thread;
 use std::thread::JoinHandle;
 use rustc_serialize::json;
+use rustc_serialize::Encodable;
 use websocket::Message;
 use websocket::client::request::Url;
 use websocket::dataframe::DataFrame;
@@ -24,6 +26,7 @@ type Client = websocket::Client<DataFrame, sender::Sender<WebSocketStream>, rece
 pub struct DdpClient {
     receiver: JoinHandle<()>,
     sender:   JoinHandle<()>,
+    outgoing:  Arc<Mutex<AtomicSender<Box<Encodable>>>>,
     session_id: Arc<String>,
     version: &'static str,
 }
@@ -33,7 +36,9 @@ impl DdpClient {
         let (client, session_id, v_index) = try!( DdpClient::connect(url) );
         let (mut sender, mut receiver) = client.split();
 
-        let (tx, rx) = channel();
+        let (tx , rx) = channel();
+        let tx: Arc<Mutex<AtomicSender<Box<Encodable>>>> = Arc::new(Mutex::new(tx));
+        let atomic_tx = tx.clone();
 
         let receiver_loop = thread::spawn(move || {
             for message in receiver.incoming_messages() {
@@ -44,10 +49,11 @@ impl DdpClient {
                 };
 
                 if let Some(ping) = Ping::from_response(&message) {
-                    tx.send(Pong {
+                    let transfer = atomic_tx.lock().unwrap();
+                    transfer.send(Box::new(Pong {
                         msg: "pong",
                         id:  ping.id,
-                    }).unwrap();
+                    })).unwrap();
                 }
             }
         });
@@ -63,6 +69,7 @@ impl DdpClient {
             receiver:   receiver_loop,
             sender:     sender_loop,
             session_id: Arc::new(session_id),
+            outgoing:   &tx.clone(),
             version:    VERSIONS[v_index],
         })
     }
@@ -116,6 +123,17 @@ impl DdpClient {
             };
         }
     }
+
+    pub fn call(method: &str, params: Option<&[&str]>) {
+        let message = json::encode(&Method {
+            method: method,
+            params: params,
+        }).unwrap();
+        let message = Message::Text(message);
+        // Send message here.
+    }
+
+    // TODO: Add method to call with random seed
 
     pub fn block_until_err(self) {
         self.receiver.join().ok();
