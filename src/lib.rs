@@ -1,10 +1,8 @@
 extern crate rustc_serialize;
 extern crate websocket;
 
-use std::io::Write;
-use std::io::Read;
-use rustc_serialize::json::Json;
 use rustc_serialize::json;
+use rustc_serialize::Encodable;
 use websocket::Message;
 use websocket::client::request::Url;
 use websocket::dataframe::DataFrame;
@@ -23,37 +21,91 @@ use requests::*;
 
 type Client = websocket::Client<DataFrame, Sender<WebSocketStream>, Receiver<WebSocketStream>>;
 
-
-fn handshake(url: &Url) -> WebSocketResult<Client> {
-    // Handshake with the server
-    let knock  = try!( Client::connect(url) );
-    let answer = try!( knock.send() );
-    try!( answer.validate() );
-
-    // Get referennce to the client
-    Ok(answer.begin())
+pub struct DdpClient {
+    client: Client,
+    session_id: String,
+    version: &'static str,
 }
 
-fn negotiate(client: &mut Client, version: &str) -> WebSocketResult<NegotiateResp> {
-    let request = requests::Connect::new(version);
-    let request = Message::Text(request.to_json());
+impl DdpClient {
+    pub fn new(url: &Url) -> Result<Self, DdpConnError> {
+        let (client, session_id, v_index) = try!( DdpClient::connect(url) );
+        Ok(DdpClient {
+            client:     client,
+            session_id: session_id,
+            version:    VERSIONS[v_index],
+        })
+    }
 
-    try!( client.send_message(request) );
+    fn handshake(url: &Url) -> Result<Client, DdpConnError> {
+        // Handshake with the server
+        let knock  = try!( Client::connect(url).map_err(|e| DdpConnError::Network(e)) );
+        let answer = try!( knock.send()        .map_err(|e| DdpConnError::Network(e)) );
+        try!( answer.validate()                .map_err(|e| DdpConnError::Network(e)) );
 
-    for msg_result in client.incoming_messages::<Message>() {
-        if let Ok(Message::Text(plaintext)) = msg_result {
-            if let Ok(success) = json::decode::<VersionSuccess>(&plaintext) {
-                if success.msg == "connected" {
-                    return Ok(NegotiateResp::SessionId(success.session));
-                }
-            } else if let Ok(failure) = json::decode::<VersionFailed>(&plaintext) {
-                if failure.msg == "failed" {
-                    return Ok(NegotiateResp::Version(failure.version));
+        // Get referennce to the client
+        Ok(answer.begin())
+    }
+
+    fn negotiate(client: &mut Client, version: &str) -> Result<NegotiateResp, DdpConnError> {
+        let request = requests::Connect::new(version);
+        let request = Message::Text(request.to_json());
+
+        try!( client.send_message(request).map_err(|e| DdpConnError::Network(e)) );
+
+        for msg_result in client.incoming_messages::<Message>() {
+            if let Ok(Message::Text(plaintext)) = msg_result {
+                if let Ok(success) = json::decode::<VersionSuccess>(&plaintext) {
+                    if success.msg == "connected" {
+                        return Ok(NegotiateResp::SessionId(success.session));
+                    }
+                } else if let Ok(failure) = json::decode::<VersionFailed>(&plaintext) {
+                    if failure.msg == "failed" {
+                        return Ok(NegotiateResp::Version(failure.version));
+                    }
                 }
             }
         }
+        Err(DdpConnError::NoVersionFromServer)
     }
-    Err(WebSocketError::ResponseError("No protocol version reply from the server.".to_string()))
+
+    fn connect(url: &Url) -> Result<(Client, String, usize), DdpConnError> {
+        let mut client = try!( DdpClient::handshake(url) );
+        let mut version = VER_NOW;
+        let mut v_index = 0;
+
+        loop {
+            match DdpClient::negotiate(&mut client, version) {
+                Err(e) => return Err(e),
+                Ok(NegotiateResp::SessionId(session)) => return Ok((client, session, v_index)),
+                Ok(NegotiateResp::Version(server_version))   => {
+                    // TODO: Maybe this should be faster, maybe its enough.
+                    let found = VERSIONS.iter().enumerate().find(|&(_, &v)| *v == server_version);
+                    if let Some((i, &v)) = found {
+                        v_index = i;
+                        version = v;
+                    } else {
+                        return Err(DdpConnError::NoMatchingVersion);
+                    }
+                },
+            };
+        }
+    }
+
+    pub fn send_raw<E>(&mut self, message: &E) where E: Encodable {
+        // TODO: Unsafe
+        let message = json::encode(message).unwrap();
+        let message = Message::Text(message);
+        self.client.send_message(message).ok();
+    }
+
+    pub fn session(&self) -> &str {
+        &self.session_id
+    }
+
+    pub fn version(&self) -> &str {
+        &self.version
+    }
 }
 
 pub enum NegotiateResp {
@@ -61,73 +113,22 @@ pub enum NegotiateResp {
     Version(String),
 }
 
-fn connect(url: &Url) -> WebSocketResult<(Client, String)> {
-    let mut client = try!( handshake(url) );
-    let mut curr_version = VER_NOW;
-
-    loop {
-        match negotiate(&mut client, curr_version) {
-            Err(e) => return Err(e),
-            Ok(NegotiateResp::SessionId(session)) => return Ok((client, session)),
-            Ok(NegotiateResp::Version(version))   => {
-                if let Some(v) = VERSIONS.iter().find(|&v| *v == version) {
-                    curr_version = v;
-                } else {
-                    return Err(WebSocketError::ResponseError("No matching version.".to_string()));
-                }
-            },
-        };
-    }
+#[derive(Debug)]
+pub enum DdpConnError {
+    Network(WebSocketError),
+    NoVersionFromServer,
+    NoMatchingVersion,
 }
 
+
 #[test]
-fn it_works() {
-
+fn test_connect_version() {
     let url = Url::parse("ws://127.0.0.1:3000/websocket").unwrap(); // Get the URL
-    // assert_eq!("{:?}", format!("{:?}", request));
 
-    if let Ok((client, session_id)) = connect(&url) {
-        println!("The session id is: {}", session_id);
-    }
+    let ddp_client_result = DdpClient::new(&url);
 
-    // let request = Client::connect(url).ok().expect("Could not connect"); // Connect to the server
-    // let response = request.send().ok().expect("Could not send response."); // Send the request
-    //
-    //
-    // response.validate().ok().expect("response is not valid!!"); // Ensure the response is valid
-    //
-    // let mut client = response.begin(); // Get a Client
-    // let body = "{
-    //     \"msg\":     \"connect\",
-    //     \"version\": \"1\",
-    //     \"support\": [\"1\", \"pre2\", \"pre1\"]
-    // }".to_string();
-    //
-    // let message = Message::Text(body);
-    // client.send_message(message).ok().unwrap(); // Send message
-    //
-    // for message in client.incoming_messages::<Message>() {
-    //
-    //     let json_text = match message.ok().unwrap() {
-    //         Message::Text(plain) => plain,
-    //         _ => unreachable!(),
-    //     };
-    //
-    //     let json = Json::from_str(&json_text);
-    //
-    //     let object = match json.ok().unwrap() {
-    //         Json::Object(o) => o,
-    //         _ => unreachable!(),
-    //     };
-    //
-    //     let message = match object.get("msg") {
-    //         Some(m) => match m.clone() {
-    //                         Json::String(s) => s,
-    //                         _ => unreachable!(),
-    //                    },
-    //         None    => "No Message".to_string(),
-    //     };
-    //
-    //     println!("The message was: {}", message);
-    // }
+    match ddp_client_result {
+        Ok(client) => println!("The session id is: {} with DDP v{}", client.session(), client.version()),
+        Err(err)   => panic!("An error occured: {:?}", err),
+    };
 }
