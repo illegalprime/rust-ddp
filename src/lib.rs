@@ -1,17 +1,20 @@
 extern crate rustc_serialize;
 extern crate websocket;
 
+use std::sync::Arc;
+use std::sync::mpsc::channel;
+use std::thread;
+use std::thread::JoinHandle;
 use rustc_serialize::json;
-use rustc_serialize::Encodable;
 use websocket::Message;
 use websocket::client::request::Url;
 use websocket::dataframe::DataFrame;
-use websocket::client::sender::Sender;
-use websocket::client::receiver::Receiver;
+use websocket::client::sender;
+use websocket::client::receiver;
+use websocket::ws::receiver::Receiver;
+use websocket::ws::sender::Sender;
 use websocket::stream::WebSocketStream;
 use websocket::result::WebSocketError;
-
-pub use websocket::result::WebSocketResult;
 
 mod requests;
 mod responses;
@@ -19,20 +22,50 @@ mod responses;
 use responses::*;
 use requests::*;
 
-type Client = websocket::Client<DataFrame, Sender<WebSocketStream>, Receiver<WebSocketStream>>;
+type Client = websocket::Client<DataFrame, sender::Sender<WebSocketStream>, receiver::Receiver<WebSocketStream>>;
 
 pub struct DdpClient {
-    client: Client,
-    session_id: String,
+    receiver: JoinHandle<()>,
+    sender:   JoinHandle<()>,
+    session_id: Arc<String>,
     version: &'static str,
 }
 
 impl DdpClient {
     pub fn new(url: &Url) -> Result<Self, DdpConnError> {
         let (client, session_id, v_index) = try!( DdpClient::connect(url) );
+        let (mut sender, mut receiver) = client.split();
+
+        let (tx, rx) = channel();
+
+        let receiver_loop = thread::spawn(move || {
+            for message in receiver.incoming_messages() {
+                let message = match message {
+                    Ok(Message::Text(m))  => m,
+                    // TODO: Something more meaningful should happen.
+                    _ => continue,
+                };
+
+                if let Some(ping) = Ping::from_response(&message) {
+                    tx.send(Pong {
+                        msg: "pong",
+                        id:  ping.id,
+                    }).unwrap();
+                }
+            }
+        });
+
+        let sender_loop = thread::spawn(move || {
+            while let Ok(message) = rx.recv() {
+                let message = Message::Text(json::encode(&message).unwrap());
+                sender.send_message(message).unwrap();
+            }
+        });
+
         Ok(DdpClient {
-            client:     client,
-            session_id: session_id,
+            receiver:   receiver_loop,
+            sender:     sender_loop,
+            session_id: Arc::new(session_id),
             version:    VERSIONS[v_index],
         })
     }
@@ -53,19 +86,16 @@ impl DdpClient {
 
         try!( client.send_message(request).map_err(|e| DdpConnError::Network(e)) );
 
-        for msg_result in client.incoming_messages::<Message>() {
+        for msg_result in client.incoming_messages() {
             if let Ok(Message::Text(plaintext)) = msg_result {
-                if let Ok(success) = json::decode::<VersionSuccess>(&plaintext) {
-                    if success.msg == "connected" {
-                        return Ok(NegotiateResp::SessionId(success.session));
-                    }
-                } else if let Ok(failure) = json::decode::<VersionFailed>(&plaintext) {
-                    if failure.msg == "failed" {
-                        return Ok(NegotiateResp::Version(failure.version));
-                    }
+                if let Some(success) = VersionSuccess::from_response(&plaintext) {
+                    return Ok(NegotiateResp::SessionId(success.session));
+                } else if let Some(failure) = VersionFailed::from_response(&plaintext) {
+                    return Ok(NegotiateResp::Version(failure.version));
                 }
             }
         }
+        // TODO: This is probably unreachable
         Err(DdpConnError::NoVersionFromServer)
     }
 
@@ -78,7 +108,7 @@ impl DdpClient {
             match DdpClient::negotiate(&mut client, version) {
                 Err(e) => return Err(e),
                 Ok(NegotiateResp::SessionId(session)) => return Ok((client, session, v_index)),
-                Ok(NegotiateResp::Version(server_version))   => {
+                Ok(NegotiateResp::Version(server_version)) => {
                     // TODO: Maybe this should be faster, maybe its enough.
                     let found = VERSIONS.iter().enumerate().find(|&(_, &v)| *v == server_version);
                     if let Some((i, &v)) = found {
@@ -92,11 +122,9 @@ impl DdpClient {
         }
     }
 
-    pub fn send_raw<E>(&mut self, message: &E) where E: Encodable {
-        // TODO: Unsafe
-        let message = json::encode(message).unwrap();
-        let message = Message::Text(message);
-        self.client.send_message(message).ok();
+    pub fn block_until_err(self) {
+        self.receiver.join().ok();
+        self.sender.join().ok();
     }
 
     pub fn session(&self) -> &str {
@@ -127,8 +155,12 @@ fn test_connect_version() {
 
     let ddp_client_result = DdpClient::new(&url);
 
-    match ddp_client_result {
-        Ok(client) => println!("The session id is: {} with DDP v{}", client.session(), client.version()),
+    let client = match ddp_client_result {
+        Ok(client) => client,
         Err(err)   => panic!("An error occured: {:?}", err),
     };
+
+    println!("The session id is: {} with DDP v{}", client.session(), client.version());
+
+    client.block_until_err();
 }

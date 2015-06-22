@@ -27,3 +27,9 @@ impl<'l> Connect<'l> {
         json::encode(self).unwrap()
     }
 }
+
+#[derive(RustcEncodable)]
+pub struct Pong {
+    pub msg: &'static str,
+    pub id:  Option<String>,
+}
