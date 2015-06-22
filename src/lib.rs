@@ -16,11 +16,8 @@ use websocket::ws::sender::Sender;
 use websocket::stream::WebSocketStream;
 use websocket::result::WebSocketError;
 
-mod requests;
-mod responses;
-
-use responses::*;
-use requests::*;
+mod messages;
+use messages::*;
 
 type Client = websocket::Client<DataFrame, sender::Sender<WebSocketStream>, receiver::Receiver<WebSocketStream>>;
 
@@ -80,17 +77,17 @@ impl DdpClient {
         Ok(answer.begin())
     }
 
-    fn negotiate(client: &mut Client, version: &str) -> Result<NegotiateResp, DdpConnError> {
-        let request = requests::Connect::new(version);
-        let request = Message::Text(request.to_json());
+    fn negotiate(client: &mut Client, version: &'static str) -> Result<NegotiateResp, DdpConnError> {
+        let request = Connect::new(version);
+        let request = Message::Text(json::encode(&request).unwrap());
 
         try!( client.send_message(request).map_err(|e| DdpConnError::Network(e)) );
 
         for msg_result in client.incoming_messages() {
             if let Ok(Message::Text(plaintext)) = msg_result {
-                if let Some(success) = VersionSuccess::from_response(&plaintext) {
+                if let Some(success) = Connected::from_response(&plaintext) {
                     return Ok(NegotiateResp::SessionId(success.session));
-                } else if let Some(failure) = VersionFailed::from_response(&plaintext) {
+                } else if let Some(failure) = Failed::from_response(&plaintext) {
                     return Ok(NegotiateResp::Version(failure.version));
                 }
             }
@@ -101,19 +98,17 @@ impl DdpClient {
 
     fn connect(url: &Url) -> Result<(Client, String, usize), DdpConnError> {
         let mut client = try!( DdpClient::handshake(url) );
-        let mut version = VER_NOW;
         let mut v_index = 0;
 
         loop {
-            match DdpClient::negotiate(&mut client, version) {
+            match DdpClient::negotiate(&mut client, VERSIONS[v_index]) {
                 Err(e) => return Err(e),
                 Ok(NegotiateResp::SessionId(session)) => return Ok((client, session, v_index)),
                 Ok(NegotiateResp::Version(server_version)) => {
                     // TODO: Maybe this should be faster, maybe its enough.
                     let found = VERSIONS.iter().enumerate().find(|&(_, &v)| *v == server_version);
-                    if let Some((i, &v)) = found {
-                        v_index = i;
-                        version = v;
+                    v_index = if let Some((i, _)) = found {
+                        i
                     } else {
                         return Err(DdpConnError::NoMatchingVersion);
                     }
@@ -131,7 +126,7 @@ impl DdpClient {
         &self.session_id
     }
 
-    pub fn version(&self) -> &str {
+    pub fn version(&self) -> &'static str {
         &self.version
     }
 }
