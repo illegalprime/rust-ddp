@@ -1,11 +1,15 @@
 extern crate rustc_serialize;
 extern crate websocket;
+extern crate rand;
 
+use std::boxed::FnBox;
+use std::collections::hash_map::HashMap;
 use std::sync::{Arc, Mutex};
 use std::sync::mpsc::channel;
 use std::sync::mpsc::Sender as AtomicSender;
 use std::thread;
 use std::thread::JoinHandle;
+use rand::Rng;
 use rustc_serialize::json;
 use rustc_serialize::Encodable;
 use websocket::Message;
@@ -23,22 +27,26 @@ use messages::*;
 
 type Client = websocket::Client<DataFrame, sender::Sender<WebSocketStream>, receiver::Receiver<WebSocketStream>>;
 
-pub struct DdpClient {
+pub struct DdpClient<'l> {
     receiver: JoinHandle<()>,
     sender:   JoinHandle<()>,
-    outgoing:  Arc<Mutex<AtomicSender<Box<Encodable>>>>,
     session_id: Arc<String>,
+    outgoing:   Arc<Mutex<AtomicSender<String>>>,
+    pending_methods: Arc<Mutex<HashMap<String, Box<FnBox(String, String) + 'l>>>>,
     version: &'static str,
 }
 
-impl DdpClient {
+impl<'l> DdpClient<'l> {
     pub fn new(url: &Url) -> Result<Self, DdpConnError> {
         let (client, session_id, v_index) = try!( DdpClient::connect(url) );
         let (mut sender, mut receiver) = client.split();
 
-        let (tx , rx) = channel();
-        let tx: Arc<Mutex<AtomicSender<Box<Encodable>>>> = Arc::new(Mutex::new(tx));
-        let atomic_tx = tx.clone();
+        let (tx, rx) = channel();
+        let tx = Arc::new(Mutex::new(tx));
+        let tx_looper = tx.clone();
+
+        let methods = Arc::new(Mutex::new(HashMap::new()));
+        let methods_looper = methods.clone();
 
         let receiver_loop = thread::spawn(move || {
             for message in receiver.incoming_messages() {
@@ -49,19 +57,25 @@ impl DdpClient {
                 };
 
                 if let Some(ping) = Ping::from_response(&message) {
-                    let transfer = atomic_tx.lock().unwrap();
-                    transfer.send(Box::new(Pong {
+                    DdpClient::send(Pong {
                         msg: "pong",
                         id:  ping.id,
-                    })).unwrap();
+                    }, &tx_looper);
+                }
+                else if let Some(out) = MethodResult::from_response(&message) {
+                    // let methods: HashMap<String, Box<FnBox(String, String) + 'l>> = methods_looper.lock().unwrap();
+                    //
+                    // if let Some(callback) = methods.remove(&out.id) {
+                    //
+                    //     callback(out.error, out.result);
+                    // }
                 }
             }
         });
 
         let sender_loop = thread::spawn(move || {
             while let Ok(message) = rx.recv() {
-                let message = Message::Text(json::encode(&message).unwrap());
-                sender.send_message(message).unwrap();
+                sender.send_message(Message::Text(message)).unwrap();
             }
         });
 
@@ -69,7 +83,8 @@ impl DdpClient {
             receiver:   receiver_loop,
             sender:     sender_loop,
             session_id: Arc::new(session_id),
-            outgoing:   &tx.clone(),
+            outgoing:   tx,
+            pending_methods: methods,
             version:    VERSIONS[v_index],
         })
     }
@@ -114,23 +129,28 @@ impl DdpClient {
                 Ok(NegotiateResp::Version(server_version)) => {
                     // TODO: Maybe this should be faster, maybe its enough.
                     let found = VERSIONS.iter().enumerate().find(|&(_, &v)| *v == server_version);
-                    v_index = if let Some((i, _)) = found {
-                        i
-                    } else {
-                        return Err(DdpConnError::NoMatchingVersion);
-                    }
+                    v_index = match found {
+                        Some((i, _)) => i,
+                        _ => return Err(DdpConnError::NoMatchingVersion),
+                    };
                 },
             };
         }
     }
 
-    pub fn call(method: &str, params: Option<&[&str]>) {
-        let message = json::encode(&Method {
+    pub fn call<C: FnBox(String, String) + 'l>(&mut self, method: &str, params: Option<&str>, callback: C) {
+        // TODO: Make better ID.
+        let id: i32 = 1;
+        let id = id.to_string();
+
+        DdpClient::send(Method {
+            msg:    "method",
+            id:     &id,
             method: method,
             params: params,
-        }).unwrap();
-        let message = Message::Text(message);
-        // Send message here.
+        }, &self.outgoing);
+
+        self.pending_methods.lock().unwrap().insert(id, Box::new(callback));
     }
 
     // TODO: Add method to call with random seed
@@ -146,6 +166,10 @@ impl DdpClient {
 
     pub fn version(&self) -> &'static str {
         &self.version
+    }
+
+    fn send<T: Encodable>(message: T, tx: &Arc<Mutex<AtomicSender<String>>>) {
+        tx.lock().unwrap().send(json::encode(&message).unwrap()).unwrap();
     }
 }
 

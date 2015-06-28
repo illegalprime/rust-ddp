@@ -6,3 +6,4 @@ authors = ["Michael Eden <themichaeleden@gmail.com>"]
 [dependencies]
 websocket = "0.12.1"
 rustc-serialize = "0.3.15"
+rand = "0.3.8"

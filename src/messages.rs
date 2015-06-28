@@ -35,8 +35,18 @@ pub struct Pong {
 
 #[derive(RustcEncodable)]
 pub struct Method<'l> {
+    pub msg:    &'static str,
+    pub id:     &'l str,
     pub method: &'l str,
-    pub params: Option<&'l [&'l str]>,
+    pub params: Option<&'l str>,
+}
+
+#[derive(RustcDecodable)]
+pub struct MethodResult {
+    pub msg:    String,
+    pub id:     String,
+    pub error:  String,
+    pub result: String,
 }
 
 impl Connect {
@@ -51,6 +61,17 @@ impl Connect {
 
 pub trait FromResponse {
     fn from_response(response: &str) -> Option<Self>;
+}
+
+impl FromResponse for MethodResult {
+    fn from_response(response: &str) -> Option<Self> {
+        if let Ok(decoded) = json::decode::<MethodResult>(response) {
+            if decoded.msg == "result" {
+                return Some(decoded);
+            }
+        }
+        None
+    }
 }
 
 impl FromResponse for Ping {
