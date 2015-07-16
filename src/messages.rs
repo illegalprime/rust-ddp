@@ -1,13 +1,11 @@
 use rustc_serialize::json;
 
 pub const VERSIONS: &'static [&'static str; 3] = &["1", "pre2", "pre1"];
+pub type Ejson = String;
 
-#[derive(RustcEncodable)]
-pub struct Connect {
-    msg: &'static str,
-    version: &'static str,
-    support: &'static [&'static str],
-}
+/***************************
+ *        Responses        *
+ ***************************/
 
 #[derive(RustcDecodable)]
 pub struct Connected {
@@ -27,26 +25,49 @@ pub struct Ping {
     pub id:  Option<String>,
 }
 
-#[derive(RustcEncodable)]
-pub struct Pong {
-    pub msg: &'static str,
-    pub id:  Option<String>,
-}
-
-#[derive(RustcEncodable)]
-pub struct Method<'l> {
-    pub msg:    &'static str,
-    pub id:     &'l str,
-    pub method: &'l str,
-    pub params: Option<&'l str>,
-}
-
 #[derive(RustcDecodable)]
 pub struct MethodResult {
     pub msg:    String,
     pub id:     String,
     pub error:  String,
     pub result: String,
+}
+
+/***************************
+ *        Requests         *
+ ***************************/
+
+#[derive(RustcEncodable)]
+pub struct Connect {
+    msg: &'static str,
+    version: &'static str,
+    support: &'static [&'static str],
+}
+
+pub struct Pong;
+
+pub struct Method;
+
+impl Pong {
+    pub fn text(id: Option<String>) -> String {
+        if let Some(id) = id {
+            format!("{{\"msg\":\"pong\",\"id\":{}}}", id)
+        } else {
+            "{\"msg\":\"pong\"}".to_string()
+        }
+    }
+}
+
+impl Method {
+    pub fn text<'l>(method: &'l str, params: Option<Vec<Ejson>>) -> (String, String) {
+        // TODO: Make a real random ID.
+        let id = "R8nXmEpHtpMfi6xJZ".to_string();
+        if let Some(args) = params {
+            (format!("{{\"msg\":\"method\",\"id\":\"{}\",\"method\":\"{}\",\"params\":{:?}}}", &id, method, args), id)
+        } else {
+            (format!("{{\"msg\":\"method\",\"id\":\"{}\",\"method\":\"{}\"}}", &id, method), id)
+        }
+    }
 }
 
 impl Connect {

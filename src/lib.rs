@@ -2,16 +2,14 @@ extern crate rustc_serialize;
 extern crate websocket;
 extern crate rand;
 
-use std::boxed::FnBox;
 use std::collections::hash_map::HashMap;
 use std::sync::{Arc, Mutex};
 use std::sync::mpsc::channel;
 use std::sync::mpsc::Sender as AtomicSender;
 use std::thread;
 use std::thread::JoinHandle;
-use rand::Rng;
+// use rand::Rng;
 use rustc_serialize::json;
-use rustc_serialize::Encodable;
 use websocket::Message;
 use websocket::client::request::Url;
 use websocket::dataframe::DataFrame;
@@ -27,16 +25,18 @@ use messages::*;
 
 type Client = websocket::Client<DataFrame, sender::Sender<WebSocketStream>, receiver::Receiver<WebSocketStream>>;
 
-pub struct DdpClient<'l> {
+pub struct DdpClient {
     receiver: JoinHandle<()>,
     sender:   JoinHandle<()>,
     session_id: Arc<String>,
     outgoing:   Arc<Mutex<AtomicSender<String>>>,
-    pending_methods: Arc<Mutex<HashMap<String, Box<FnBox(String, String) + 'l>>>>,
+    pending_methods: Arc<Mutex<HashMap<String, Box<FnMut(String, String) + Send + 'static>>>>,
     version: &'static str,
 }
 
-impl<'l> DdpClient<'l> {
+// TODO: Get rid of all the null values in JSON responses
+
+impl DdpClient {
     pub fn new(url: &Url) -> Result<Self, DdpConnError> {
         let (client, session_id, v_index) = try!( DdpClient::connect(url) );
         let (mut sender, mut receiver) = client.split();
@@ -56,25 +56,23 @@ impl<'l> DdpClient<'l> {
                     _ => continue,
                 };
 
+                println!("<- {}", &message);
+
                 if let Some(ping) = Ping::from_response(&message) {
-                    DdpClient::send(Pong {
-                        msg: "pong",
-                        id:  ping.id,
-                    }, &tx_looper);
+                    DdpClient::send(Pong::text(ping.id), &tx_looper);
                 }
                 else if let Some(out) = MethodResult::from_response(&message) {
-                    // let methods: HashMap<String, Box<FnBox(String, String) + 'l>> = methods_looper.lock().unwrap();
-                    //
-                    // if let Some(callback) = methods.remove(&out.id) {
-                    //
-                    //     callback(out.error, out.result);
-                    // }
+                    if let Some(method) = methods_looper.lock().unwrap().remove(&out.id) {
+                        let mut method: Box<FnMut(String, String) + Send + 'static> = method;
+                        method(out.error, out.result);
+                    }
                 }
             }
         });
 
         let sender_loop = thread::spawn(move || {
             while let Ok(message) = rx.recv() {
+                println!("-> {}", &message);
                 sender.send_message(Message::Text(message)).unwrap();
             }
         });
@@ -138,18 +136,9 @@ impl<'l> DdpClient<'l> {
         }
     }
 
-    pub fn call<C: FnBox(String, String) + 'l>(&mut self, method: &str, params: Option<&str>, callback: C) {
-        // TODO: Make better ID.
-        let id: i32 = 1;
-        let id = id.to_string();
-
-        DdpClient::send(Method {
-            msg:    "method",
-            id:     &id,
-            method: method,
-            params: params,
-        }, &self.outgoing);
-
+    pub fn call<C: FnMut(String, String) + Send + 'static>(&self, method: &str, params: Option<Vec<Ejson>>, callback: C) {
+        let (method, id) = Method::text(method, params);
+        DdpClient::send(method, &self.outgoing);
         self.pending_methods.lock().unwrap().insert(id, Box::new(callback));
     }
 
@@ -168,8 +157,8 @@ impl<'l> DdpClient<'l> {
         &self.version
     }
 
-    fn send<T: Encodable>(message: T, tx: &Arc<Mutex<AtomicSender<String>>>) {
-        tx.lock().unwrap().send(json::encode(&message).unwrap()).unwrap();
+    fn send(message: String, tx: &Arc<Mutex<AtomicSender<String>>>) {
+        tx.lock().unwrap().send(message).unwrap();
     }
 }
 
@@ -198,6 +187,10 @@ fn test_connect_version() {
     };
 
     println!("The session id is: {} with DDP v{}", client.session(), client.version());
+
+    client.call("hello", None, |_, result| {
+        println!("Ran method! => {}", result);
+    });
 
     client.block_until_err();
 }
