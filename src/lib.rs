@@ -30,7 +30,7 @@ pub struct DdpClient {
     sender:   JoinHandle<()>,
     session_id: Arc<String>,
     outgoing:   Arc<Mutex<AtomicSender<String>>>,
-    pending_methods: Arc<Mutex<HashMap<String, Box<FnMut(String, String) + Send + 'static>>>>,
+    pending_methods: Arc<Mutex<HashMap<String, Box<FnMut(Result<Ejson, Ejson>) + Send + 'static>>>>,
     version: &'static str,
 }
 
@@ -50,22 +50,39 @@ impl DdpClient {
 
         let receiver_loop = thread::spawn(move || {
             for message in receiver.incoming_messages() {
-                let message = match message {
+                let message_text = match message {
                     Ok(Message::Text(m))  => m,
                     // TODO: Something more meaningful should happen.
                     _ => continue,
                 };
 
-                println!("<- {}", &message);
+                println!("<- {}", &message_text);
 
-                if let Some(ping) = Ping::from_response(&message) {
-                    DdpClient::send(Pong::text(ping.id), &tx_looper);
-                }
-                else if let Some(out) = MethodResult::from_response(&message) {
-                    if let Some(method) = methods_looper.lock().unwrap().remove(&out.id) {
-                        let mut method: Box<FnMut(String, String) + Send + 'static> = method;
-                        method(out.error, out.result);
-                    }
+                let message = json::Json::from_str(&message_text).unwrap();
+                let message = match message.as_object() {
+                    Some(o) => o,
+                    _ => continue,
+                };
+
+                match message.get("msg").unwrap().as_string() {
+                    Some("ping") => {
+                        let id = message.get("id").map(|id| id.as_string().unwrap());
+                        DdpClient::send(Pong::text(id), &tx_looper);
+                    },
+                    Some("result") => {
+                        let id = message.get("id").unwrap().as_string().unwrap();
+                        let error = message.get("error");
+                        let result = message.get("result");
+                        if let Some(method) = methods_looper.lock().unwrap().remove(id) {
+                            let mut method: Box<FnMut(Result<Ejson, Ejson>) + Send + 'static> = method;
+                            match (error, result) {
+                                (Some(e), None)    => method(Err(e.as_string().unwrap().to_string())),
+                                (None,    Some(r)) => method(Ok(r.as_string().unwrap().to_string())),
+                                _                  => continue,
+                            }
+                        }
+                    },
+                    _ => continue,
                 }
             }
         });
@@ -136,7 +153,7 @@ impl DdpClient {
         }
     }
 
-    pub fn call<C: FnMut(String, String) + Send + 'static>(&self, method: &str, params: Option<Vec<Ejson>>, callback: C) {
+    pub fn call<C: FnMut(Result<Ejson, Ejson>) + Send + 'static>(&self, method: &str, params: Option<Vec<Ejson>>, callback: C) {
         let (method, id) = Method::text(method, params);
         DdpClient::send(method, &self.outgoing);
         self.pending_methods.lock().unwrap().insert(id, Box::new(callback));
@@ -188,8 +205,20 @@ fn test_connect_version() {
 
     println!("The session id is: {} with DDP v{}", client.session(), client.version());
 
-    client.call("hello", None, |_, result| {
-        println!("Ran method! => {}", result);
+    client.call("hello", None, |result| {
+        print!("Ran method, ");
+        match result {
+            Ok(output) => println!("got a result: {}", output),
+            Err(error) => println!("got an error: {}", error),
+        }
+    });
+
+    client.call("not_a_method", None, |result| {
+        print!("Ran method, ");
+        match result {
+            Ok(output) => println!("got a result: {}", output),
+            Err(error) => println!("got an error: {}", error),
+        }
     });
 
     client.block_until_err();

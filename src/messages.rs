@@ -29,7 +29,6 @@ pub struct Ping {
 pub struct MethodResult {
     pub msg:    String,
     pub id:     String,
-    pub error:  String,
     pub result: String,
 }
 
@@ -49,7 +48,7 @@ pub struct Pong;
 pub struct Method;
 
 impl Pong {
-    pub fn text(id: Option<String>) -> String {
+    pub fn text<'l>(id: Option<&'l str>) -> String {
         if let Some(id) = id {
             format!("{{\"msg\":\"pong\",\"id\":{}}}", id)
         } else {
