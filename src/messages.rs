@@ -1,7 +1,9 @@
 use rustc_serialize::json;
 
+use random::Random;
+
 pub const VERSIONS: &'static [&'static str; 3] = &["1", "pre2", "pre1"];
-pub type Ejson = String;
+pub type Ejson = json::Json;
 
 /***************************
  *        Responses        *
@@ -59,8 +61,8 @@ impl Pong {
 
 impl Method {
     pub fn text<'l>(method: &'l str, params: Option<Vec<Ejson>>) -> (String, String) {
-        // TODO: Make a real random ID.
-        let id = "R8nXmEpHtpMfi6xJZ".to_string();
+        // TODO: Make faster.
+        let id = Random::new().id();
         if let Some(args) = params {
             (format!("{{\"msg\":\"method\",\"id\":\"{}\",\"method\":\"{}\",\"params\":{:?}}}", &id, method, args), id)
         } else {

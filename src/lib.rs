@@ -1,6 +1,5 @@
 extern crate rustc_serialize;
 extern crate websocket;
-extern crate rand;
 
 use std::collections::hash_map::HashMap;
 use std::sync::{Arc, Mutex};
@@ -22,6 +21,8 @@ use websocket::result::WebSocketError;
 
 mod messages;
 use messages::*;
+
+mod random;
 
 type Client = websocket::Client<DataFrame, sender::Sender<WebSocketStream>, receiver::Receiver<WebSocketStream>>;
 
@@ -49,8 +50,8 @@ impl DdpClient {
         let methods_looper = methods.clone();
 
         let receiver_loop = thread::spawn(move || {
-            for message in receiver.incoming_messages() {
-                let message_text = match message {
+            for packet in receiver.incoming_messages() {
+                let message_text = match packet {
                     Ok(Message::Text(m))  => m,
                     // TODO: Something more meaningful should happen.
                     _ => continue,
@@ -58,8 +59,8 @@ impl DdpClient {
 
                 println!("<- {}", &message_text);
 
-                let message = json::Json::from_str(&message_text).unwrap();
-                let message = match message.as_object() {
+                let message_json = json::Json::from_str(&message_text).unwrap();
+                let message = match message_json.as_object() {
                     Some(o) => o,
                     _ => continue,
                 };
@@ -76,8 +77,8 @@ impl DdpClient {
                         if let Some(method) = methods_looper.lock().unwrap().remove(id) {
                             let mut method: Box<FnMut(Result<Ejson, Ejson>) + Send + 'static> = method;
                             match (error, result) {
-                                (Some(e), None)    => method(Err(e.as_string().unwrap().to_string())),
-                                (None,    Some(r)) => method(Ok(r.as_string().unwrap().to_string())),
+                                (Some(e), None)    => method(Err(e.clone())),
+                                (None,    Some(r)) => method(Ok(r.clone())),
                                 _                  => continue,
                             }
                         }
