@@ -1,7 +1,10 @@
 [package]
 name = "ddp"
-version = "0.1.0"
+version = "0.0.1"
+description = "A Rust Library to connect to ddp / Meteor servers. Under heavy development, more features to come soon."
+repository = "https://github.com/illegalprime/rust-ddp"
 authors = ["Michael Eden <themichaeleden@gmail.com>"]
+license = "MIT"
 
 [dependencies]
 websocket = "0.12.1"

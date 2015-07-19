@@ -1,5 +1,4 @@
 use rustc_serialize::json;
-
 use random::Random;
 
 pub const VERSIONS: &'static [&'static str; 3] = &["1", "pre2", "pre1"];
