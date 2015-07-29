@@ -1,5 +1,4 @@
 use rustc_serialize::json;
-use random::Random;
 
 pub const VERSIONS: &'static [&'static str; 3] = &["1", "pre2", "pre1"];
 pub type Ejson = json::Json;
@@ -48,6 +47,10 @@ pub struct Pong;
 
 pub struct Method;
 
+pub struct Subscribe;
+
+pub struct Unsubscribe;
+
 impl Pong {
     pub fn text<'l>(id: Option<&'l str>) -> String {
         if let Some(id) = id {
@@ -59,14 +62,28 @@ impl Pong {
 }
 
 impl Method {
-    pub fn text<'l>(method: &'l str, params: Option<Vec<Ejson>>) -> (String, String) {
-        // TODO: Make faster.
-        let id = Random::new().id();
+    pub fn text<'l>(id: &'l str, method: &'l str, params: Option<Vec<&Ejson>>) -> String {
         if let Some(args) = params {
-            (format!("{{\"msg\":\"method\",\"id\":\"{}\",\"method\":\"{}\",\"params\":{:?}}}", &id, method, args), id)
+            format!("{{\"msg\":\"method\",\"id\":\"{}\",\"method\":\"{}\",\"params\":{:?}}}", &id, method, args)
         } else {
-            (format!("{{\"msg\":\"method\",\"id\":\"{}\",\"method\":\"{}\"}}", &id, method), id)
+            format!("{{\"msg\":\"method\",\"id\":\"{}\",\"method\":\"{}\"}}", &id, method)
         }
+    }
+}
+
+impl Subscribe {
+    pub fn text<'l>(id: &'l str, name: &'l str, params: Option<Vec<Ejson>>) -> String {
+        if let Some(args) = params {
+            format!("{{\"msg\":\"sub\",\"id\":\"{}\",\"name\":\"{}\",\"params\":{:?}}}", &id, name, args)
+        } else {
+            format!("{{\"msg\":\"sub\",\"id\":\"{}\",\"name\":\"{}\"}}", &id, name)
+        }
+    }
+}
+
+impl Unsubscribe {
+    pub fn text<'l>(id: &'l str) -> String {
+        format!("{{\"msg\":\"unsub\",\"id\":\"{}\"}}", &id)
     }
 }
 

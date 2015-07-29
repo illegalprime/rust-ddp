@@ -1,3 +1,5 @@
+#[macro_use]
+extern crate log;
 extern crate rustc_serialize;
 extern crate websocket;
 
@@ -23,16 +25,54 @@ mod messages;
 use messages::*;
 
 mod random;
+use random::Random;
+
+mod collections;
+use collections::{MongoCollection, MongoCallbacks};
 
 type Client = websocket::Client<DataFrame, sender::Sender<WebSocketStream>, receiver::Receiver<WebSocketStream>>;
+type MethodCallback = Box<FnMut(Result<&Ejson, &Ejson>) + Send + 'static>;
+
+pub struct Methods {
+    outgoing:        Arc<Mutex<AtomicSender<String>>>,
+    pending_methods: HashMap<String, MethodCallback>,
+    rng: Random,
+}
+
+impl Methods {
+    fn new(outgoing: Arc<Mutex<AtomicSender<String>>>) -> Self {
+        Methods {
+            rng:             Random::new(),
+            pending_methods: HashMap::new(),
+            outgoing:        outgoing,
+        }
+    }
+
+    fn send<C>(&mut self, method: &str, params: Option<Vec<&Ejson>>, callback: C)
+    where C: FnMut(Result<&Ejson, &Ejson>) + Send + 'static {
+        let id = self.rng.id();
+        let method = Method::text(&id, method, params);
+        DdpClient::send(method, &self.outgoing);
+        self.pending_methods.insert(id, Box::new(callback));
+    }
+
+    fn apply(&mut self, id: &str, response: Result<&Ejson, &Ejson>) {
+        if let Some(method) = self.pending_methods.remove(id) {
+            let mut method: MethodCallback = method;
+            method(response);
+        }
+    }
+}
 
 pub struct DdpClient {
     receiver: JoinHandle<()>,
     sender:   JoinHandle<()>,
     session_id: Arc<String>,
     outgoing:   Arc<Mutex<AtomicSender<String>>>,
-    pending_methods: Arc<Mutex<HashMap<String, Box<FnMut(Result<Ejson, Ejson>) + Send + 'static>>>>,
+    pending_methods: Arc<Mutex<Methods>>,
     version: &'static str,
+    mongos: Arc<Mutex<HashMap<String, Arc<Mutex<MongoCallbacks>>>>>,
+    rng: Random,
 }
 
 // TODO: Get rid of all the null values in JSON responses
@@ -46,8 +86,11 @@ impl DdpClient {
         let tx = Arc::new(Mutex::new(tx));
         let tx_looper = tx.clone();
 
-        let methods = Arc::new(Mutex::new(HashMap::new()));
+        let methods = Arc::new(Mutex::new(Methods::new(tx.clone())));
         let methods_looper = methods.clone();
+
+        let mongos = Arc::new(Mutex::new(HashMap::new()));
+        let message_mongos = mongos.clone();
 
         let receiver_loop = thread::spawn(move || {
             for packet in receiver.incoming_messages() {
@@ -72,17 +115,40 @@ impl DdpClient {
                     },
                     Some("result") => {
                         let id = message.get("id").unwrap().as_string().unwrap();
-                        let error = message.get("error");
-                        let result = message.get("result");
-                        if let Some(method) = methods_looper.lock().unwrap().remove(id) {
-                            let mut method: Box<FnMut(Result<Ejson, Ejson>) + Send + 'static> = method;
-                            match (error, result) {
-                                (Some(e), None)    => method(Err(e.clone())),
-                                (None,    Some(r)) => method(Ok(r.clone())),
-                                _                  => continue,
-                            }
+                        let response = match (message.get("error"), message.get("result")) {
+                            (Some(e), None)    => Err(e),
+                            (None,    Some(r)) => Ok(r),
+                            _                  => continue,
+                        };
+                        methods_looper.lock().unwrap().apply(id, response);
+                    },
+                    Some("added") => {
+                        let collection = message.get("collection").unwrap().as_string().unwrap();
+                        if let Some(mongo) = message_mongos.lock().unwrap().get(collection) {
+                            let id = message.get("id").unwrap().as_string().unwrap();
+                            let fields = message.get("fields");
+                            let mongo: &Arc<Mutex<MongoCallbacks>> = mongo;
+                            mongo.lock().unwrap().notify_insert(id, fields);
                         }
                     },
+                    Some("changed") => {
+                        let collection = message.get("collection").unwrap().as_string().unwrap();
+                        if let Some(mongo) = message_mongos.lock().unwrap().get(collection) {
+                            let id = message.get("id").unwrap().as_string().unwrap();
+                            let fields = message.get("fields");
+                            let cleared = message.get("cleared");
+                            let mongo: &Arc<Mutex<MongoCallbacks>> = mongo;
+                            mongo.lock().unwrap().notify_change(id, fields, cleared);
+                        }
+                    },
+                    Some("removed") => {
+                        let collection = message.get("collection").unwrap().as_string().unwrap();
+                        if let Some(mongo) = message_mongos.lock().unwrap().get(collection) {
+                            let id = message.get("id").unwrap().as_string().unwrap();
+                            let mongo: &Arc<Mutex<MongoCallbacks>> = mongo;
+                            mongo.lock().unwrap().notify_remove(id);
+                        }
+                    }
                     _ => continue,
                 }
             }
@@ -102,6 +168,8 @@ impl DdpClient {
             outgoing:   tx,
             pending_methods: methods,
             version:    VERSIONS[v_index],
+            mongos:     mongos.clone(),
+            rng:        Random::new(),
         })
     }
 
@@ -154,13 +222,25 @@ impl DdpClient {
         }
     }
 
-    pub fn call<C: FnMut(Result<Ejson, Ejson>) + Send + 'static>(&self, method: &str, params: Option<Vec<Ejson>>, callback: C) {
-        let (method, id) = Method::text(method, params);
-        DdpClient::send(method, &self.outgoing);
-        self.pending_methods.lock().unwrap().insert(id, Box::new(callback));
+    pub fn call<C>(&mut self, method: &str, params: Option<Vec<&Ejson>>, callback: C)
+    where C: FnMut(Result<&Ejson, &Ejson>) + Send + 'static {
+        self.pending_methods.lock().unwrap().send(method, params, callback);
     }
 
-    // TODO: Add method to call with random seed
+    pub fn mongo(&mut self, collection: &str) -> MongoCollection {
+        // TODO: inefficient .get twice, .to_string bad also
+        let mut mongos = self.mongos.lock().unwrap();
+        let methods  = self.pending_methods.clone();
+        let callbacks = mongos.get(collection).map(|o| o.clone()).unwrap_or_else(|| {
+            let outgoing = self.outgoing.clone();
+            let name = collection.to_string();
+            let handler = Arc::new(Mutex::new(MongoCallbacks::new(outgoing, name)));
+            mongos.insert(collection.to_string(), handler);
+            mongos.get(collection).unwrap().clone()
+        });
+
+        MongoCollection::new(collection.to_string(), methods, callbacks)
+    }
 
     pub fn block_until_err(self) {
         self.receiver.join().ok();
@@ -192,14 +272,12 @@ pub enum DdpConnError {
     NoMatchingVersion,
 }
 
-
 #[test]
 fn test_connect_version() {
     let url = Url::parse("ws://127.0.0.1:3000/websocket").unwrap(); // Get the URL
-
     let ddp_client_result = DdpClient::new(&url);
 
-    let client = match ddp_client_result {
+    let mut client = match ddp_client_result {
         Ok(client) => client,
         Err(err)   => panic!("An error occured: {:?}", err),
     };
@@ -220,6 +298,19 @@ fn test_connect_version() {
             Ok(output) => println!("got a result: {}", output),
             Err(error) => println!("got an error: {}", error),
         }
+    });
+
+    let mongo = client.mongo("MongoColl");
+    mongo.on_add(|id, fields| {
+        println!("Added record with id: {}", &id);
+    });
+
+    let record = json::from_str("{ \"first ever meteor data from rust\": true }").unwrap();
+    mongo.insert(&record, |result| {
+        match result {
+            Err(_) => println!("First every successful insertion into Meteor through rust!"),
+            Ok(_) =>  println!("Damn! Got an error."),
+        };
     });
 
     client.block_until_err();
