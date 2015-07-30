@@ -48,7 +48,7 @@ impl Methods {
         }
     }
 
-    fn send<C>(&mut self, method: &str, params: Option<Vec<&Ejson>>, callback: C)
+    fn send<C>(&mut self, method: &str, params: Option<&Vec<&Ejson>>, callback: C)
     where C: FnMut(Result<&Ejson, &Ejson>) + Send + 'static {
         let id = self.rng.id();
         let method = Method::text(&id, method, params);
@@ -222,7 +222,7 @@ impl DdpClient {
         }
     }
 
-    pub fn call<C>(&mut self, method: &str, params: Option<Vec<&Ejson>>, callback: C)
+    pub fn call<C>(&mut self, method: &str, params: Option<&Vec<&Ejson>>, callback: C)
     where C: FnMut(Result<&Ejson, &Ejson>) + Send + 'static {
         self.pending_methods.lock().unwrap().send(method, params, callback);
     }
@@ -305,7 +305,7 @@ fn test_connect_version() {
         println!("Added record with id: {}", &id);
     });
 
-    let record = json::from_str("{ \"first ever meteor data from rust\": true }").unwrap();
+    let record = json::Json::from_str("{ \"first ever meteor data from rust\": true }").unwrap();
     mongo.insert(&record, |result| {
         match result {
             Err(_) => println!("First every successful insertion into Meteor through rust!"),

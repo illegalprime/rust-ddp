@@ -106,19 +106,15 @@ impl MongoCallbacks {
             Ok(id) => SubStatus::Subscribed(id.to_string()),
             Err(e) => SubStatus::Err(e.clone()),
         };
-        while !self.subscribed_listeners.is_empty() {
-            if let Some(mut callback) = self.subscribed_listeners.pop() {
-                callback(status.clone());
-            }
+        while let Some(mut callback) = self.subscribed_listeners.pop() {
+            callback(status.clone());
         }
     }
 
     pub fn notify_ready(&mut self) {
         self.ready = true;
-        while !self.ready_listeners.is_empty() {
-            if let Some(mut callback) = self.ready_listeners.pop() {
-                callback();
-            }
+        while let Some(mut callback) = self.ready_listeners.pop() {
+            callback();
         }
     }
 
@@ -214,22 +210,22 @@ impl MongoCollection {
 
     pub fn insert<F>(&self, record: &Ejson, callback: F) where F: FnMut(Result<&Ejson, &Ejson>) + Send + 'static {
         let method = format!("/{}/insert", self.name);
-        self.methods.lock().unwrap().send(&method, Some(vec![&record]), callback);
+        self.methods.lock().unwrap().send(&method, Some(&vec![&record]), callback);
     }
 
     pub fn update<F>(&self, selector: &Ejson, modifier: &Ejson, callback: F) where F: FnMut(Result<&Ejson, &Ejson>) + Send + 'static {
         let method = format!("/{}/update", self.name);
-        self.methods.lock().unwrap().send(&method, Some(vec![&selector, &modifier]), callback);
+        self.methods.lock().unwrap().send(&method, Some(&vec![&selector, &modifier]), callback);
     }
 
     pub fn upsert<F>(&self, selector: &Ejson, modifier: &Ejson, callback: F) where F: FnMut(Result<&Ejson, &Ejson>) + Send + 'static {
         let method = format!("/{}/upsert", self.name);
-        self.methods.lock().unwrap().send(&method, Some(vec![&selector, &modifier]), callback);
+        self.methods.lock().unwrap().send(&method, Some(&vec![&selector, &modifier]), callback);
     }
 
     pub fn remove<F>(&self, selector: &Ejson, callback: F) where F: FnMut(Result<&Ejson, &Ejson>) + Send + 'static {
         let method = format!("/{}/remove", self.name);
-        self.methods.lock().unwrap().send(&method, Some(vec![&selector]), callback);
+        self.methods.lock().unwrap().send(&method, Some(&vec![&selector]), callback);
     }
 
     pub fn name(&self) -> &str {

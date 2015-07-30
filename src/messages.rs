@@ -1,4 +1,7 @@
 use rustc_serialize::json;
+use std::fmt::Display;
+use std::fmt::Formatter;
+use std::fmt::Error as FmtError;
 
 pub const VERSIONS: &'static [&'static str; 3] = &["1", "pre2", "pre1"];
 pub type Ejson = json::Json;
@@ -51,6 +54,8 @@ pub struct Subscribe;
 
 pub struct Unsubscribe;
 
+pub struct Minify<'a>(&'a Vec<&'a json::Json>);
+
 impl Pong {
     pub fn text<'l>(id: Option<&'l str>) -> String {
         if let Some(id) = id {
@@ -62,9 +67,9 @@ impl Pong {
 }
 
 impl Method {
-    pub fn text<'l>(id: &'l str, method: &'l str, params: Option<Vec<&Ejson>>) -> String {
+    pub fn text<'l>(id: &'l str, method: &'l str, params: Option<&Vec<&Ejson>>) -> String {
         if let Some(args) = params {
-            format!("{{\"msg\":\"method\",\"id\":\"{}\",\"method\":\"{}\",\"params\":{:?}}}", &id, method, args)
+            format!("{{\"msg\":\"method\",\"id\":\"{}\",\"method\":\"{}\",\"params\":{}}}", &id, method, Minify(args))
         } else {
             format!("{{\"msg\":\"method\",\"id\":\"{}\",\"method\":\"{}\"}}", &id, method)
         }
@@ -72,9 +77,9 @@ impl Method {
 }
 
 impl Subscribe {
-    pub fn text<'l>(id: &'l str, name: &'l str, params: Option<Vec<Ejson>>) -> String {
+    pub fn text<'l>(id: &'l str, name: &'l str, params: Option<&Vec<&Ejson>>) -> String {
         if let Some(args) = params {
-            format!("{{\"msg\":\"sub\",\"id\":\"{}\",\"name\":\"{}\",\"params\":{:?}}}", &id, name, args)
+            format!("{{\"msg\":\"sub\",\"id\":\"{}\",\"name\":\"{}\",\"params\":{}}}", &id, name, Minify(args))
         } else {
             format!("{{\"msg\":\"sub\",\"id\":\"{}\",\"name\":\"{}\"}}", &id, name)
         }
@@ -94,6 +99,19 @@ impl Connect {
             version: version,
             support: VERSIONS,
         }
+    }
+}
+
+impl<'a> Display for Minify<'a> {
+    fn fmt(&self, formatter: &mut Formatter) -> Result<(), FmtError> {
+        formatter.write_str("[");
+        if let Some(first) = self.0.get(0) {
+            formatter.write_fmt(format_args!("{}", first));
+            for json in self.0.iter().skip(1) {
+                formatter.write_fmt(format_args!(",{}", json));
+            }
+        }
+        formatter.write_str("]")
     }
 }
 
