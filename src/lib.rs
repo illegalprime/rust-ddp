@@ -28,7 +28,10 @@ mod random;
 use random::Random;
 
 mod collections;
-use collections::{MongoCollection, MongoCallbacks};
+use collections::MongoCallbacks;
+
+pub use collections::MongoCollection;
+pub use collections::ListenerId;
 
 type Client = websocket::Client<DataFrame, sender::Sender<WebSocketStream>, receiver::Receiver<WebSocketStream>>;
 type MethodCallback = Box<FnMut(Result<&Ejson, &Ejson>) + Send + 'static>;

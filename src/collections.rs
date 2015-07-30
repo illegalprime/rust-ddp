@@ -7,7 +7,7 @@ use Methods;
 use messages::{Ejson, Subscribe, Unsubscribe};
 use random::Random;
 
-struct ListenerId(Listener, u32);
+pub struct ListenerId(Listener, u32);
 
 enum SubStatus {
     NotSubscribed,

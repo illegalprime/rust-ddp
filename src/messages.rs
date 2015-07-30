@@ -104,11 +104,11 @@ impl Connect {
 
 impl<'a> Display for Minify<'a> {
     fn fmt(&self, formatter: &mut Formatter) -> Result<(), FmtError> {
-        formatter.write_str("[");
+        try!( formatter.write_str("[") );
         if let Some(first) = self.0.get(0) {
-            formatter.write_fmt(format_args!("{}", first));
+            try!( formatter.write_fmt(format_args!("{}", first)) );
             for json in self.0.iter().skip(1) {
-                formatter.write_fmt(format_args!(",{}", json));
+                try!( formatter.write_fmt(format_args!(",{}", json)) );
             }
         }
         formatter.write_str("]")
