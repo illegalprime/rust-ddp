@@ -78,7 +78,7 @@ impl MongoCallbacks {
     }
 
     pub fn add_ready<F>(&mut self, f: F) where F: FnMut() + Send + 'static {
-        if (!self.ready) {
+        if !self.ready {
             self.ready_listeners.push(Box::new(f));
         }
     }
@@ -127,10 +127,6 @@ impl MongoCallbacks {
         self.decrement();
     }
 
-    pub fn size(&self) -> u32 {
-        self.count
-    }
-
     pub fn subscribed(&self) -> bool {
         match self.status {
             SubStatus::Subscribed(_) => true,
@@ -138,9 +134,9 @@ impl MongoCallbacks {
         }
     }
 
-    pub fn id(&self) -> Option<&String> {
+    pub fn id(&self) -> Option<&str> {
         match self.status {
-            SubStatus::Subscribed(ref id) => Some(id),
+            SubStatus::Subscribed(ref id) => Some(id as &str),
             _ => None,
         }
     }
@@ -202,6 +198,10 @@ impl MongoCollection {
 
     pub fn on_subscribe<F>(&self, f: F) where F: FnMut(Result<&str, &Ejson>) + Send + 'static {
         self.callbacks.lock().unwrap().add_subscribe(f);
+    }
+
+    pub fn on_ready<F>(&self, f: F) where F: FnMut() + Send + 'static {
+        self.callbacks.lock().unwrap().add_ready(f);
     }
 
     pub fn clear_listener(&self, id: ListenerId) {

@@ -75,7 +75,6 @@ pub struct DdpClient {
     pending_methods: Arc<Mutex<Methods>>,
     version: &'static str,
     mongos: Arc<Mutex<HashMap<String, Arc<Mutex<MongoCallbacks>>>>>,
-    rng: Random,
 }
 
 // TODO: Get rid of all the null values in JSON responses
@@ -151,6 +150,21 @@ impl DdpClient {
                             let mongo: &Arc<Mutex<MongoCallbacks>> = mongo;
                             mongo.lock().unwrap().notify_remove(id);
                         }
+                    },
+                    Some("ready") => {
+                        // TODO: Fix all code
+                        let ids = message.get("subs").unwrap().as_array().unwrap();
+                        for id in ids.iter() {
+                            let id = id.as_string().unwrap();
+                            // TODO: Make less stupid
+                            for mongo in message_mongos.lock().unwrap().values() {
+                                let mut mongo = mongo.lock().unwrap();
+                                if Some(id) == mongo.id() {
+                                    mongo.notify_ready();
+                                    break;
+                                }
+                            }
+                        }
                     }
                     _ => continue,
                 }
@@ -172,7 +186,6 @@ impl DdpClient {
             pending_methods: methods,
             version:    VERSIONS[v_index],
             mongos:     mongos.clone(),
-            rng:        Random::new(),
         })
     }
 
