@@ -104,7 +104,7 @@ impl DdpClient {
                     _ => continue,
                 };
 
-                println!("<- {}", &message_text);
+                debug!("<- {}", &message_text);
 
                 let message_json = json::Json::from_str(&message_text).unwrap();
                 let message = match message_json.as_object() {
@@ -171,7 +171,7 @@ impl DdpClient {
 
         let sender_loop = thread::spawn(move || {
             while let Ok(message) = rx.recv() {
-                println!("-> {}", &message);
+                debug!("-> {}", &message);
                 sender.send_message(Message::Text(message)).unwrap();
             }
         });
