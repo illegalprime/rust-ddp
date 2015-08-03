@@ -29,6 +29,7 @@ use random::Random;
 
 mod collections;
 use collections::MongoCallbacks;
+use collections::Subscriptions;
 
 pub use collections::MongoCollection;
 pub use collections::ListenerId;
@@ -68,16 +69,14 @@ impl Methods {
 }
 
 pub struct DdpClient {
-    receiver: JoinHandle<()>,
-    sender:   JoinHandle<()>,
-    session_id: Arc<String>,
-    outgoing:   Arc<Mutex<AtomicSender<String>>>,
-    pending_methods: Arc<Mutex<Methods>>,
-    version: &'static str,
-    mongos: Arc<Mutex<HashMap<String, Arc<Mutex<MongoCallbacks>>>>>,
+    methods:    Arc<Mutex<Methods>>,
+    mongos:     Arc<Mutex<HashMap<String, Arc<Mutex<MongoCallbacks>>>>>,
+    subs:       Arc<Mutex<Subscriptions>>,
+    session_id: String,
+    receiver:   JoinHandle<()>,
+    sender:     JoinHandle<()>,
+    version:    &'static str,
 }
-
-// TODO: Get rid of all the null values in JSON responses
 
 impl DdpClient {
     pub fn new(url: &Url) -> Result<Self, DdpConnError> {
@@ -93,6 +92,9 @@ impl DdpClient {
 
         let mongos = Arc::new(Mutex::new(HashMap::new()));
         let message_mongos = mongos.clone();
+
+        let subs = Arc::new(Mutex::new(Subscriptions::new(tx.clone())));
+        let message_subs = subs.clone();
 
         let receiver_loop = thread::spawn(move || {
             for packet in receiver.incoming_messages() {
@@ -110,6 +112,7 @@ impl DdpClient {
                     _ => continue,
                 };
 
+                // TODO: Stop assuming received messages are in spec
                 match message.get("msg").unwrap().as_string() {
                     Some("ping") => {
                         let id = message.get("id").map(|id| id.as_string().unwrap());
@@ -152,19 +155,9 @@ impl DdpClient {
                         }
                     },
                     Some("ready") => {
-                        // TODO: Fix all code
                         let ids = message.get("subs").unwrap().as_array().unwrap();
-                        for id in ids.iter() {
-                            let id = id.as_string().unwrap();
-                            // TODO: Make less stupid
-                            for mongo in message_mongos.lock().unwrap().values() {
-                                let mut mongo = mongo.lock().unwrap();
-                                if Some(id) == mongo.id() {
-                                    mongo.notify_ready();
-                                    break;
-                                }
-                            }
-                        }
+                        let ids: Vec<&str> = ids.iter().map(|id| id.as_string().unwrap()).collect();
+                        message_subs.lock().unwrap().notify(Ok(ids));
                     }
                     _ => continue,
                 }
@@ -179,13 +172,13 @@ impl DdpClient {
         });
 
         Ok(DdpClient {
+            methods:    methods,
+            mongos:     mongos,
+            subs:       subs,
+            session_id: session_id,
+            version:    VERSIONS[v_index],
             receiver:   receiver_loop,
             sender:     sender_loop,
-            session_id: Arc::new(session_id),
-            outgoing:   tx,
-            pending_methods: methods,
-            version:    VERSIONS[v_index],
-            mongos:     mongos.clone(),
         })
     }
 
@@ -238,19 +231,18 @@ impl DdpClient {
         }
     }
 
-    pub fn call<C>(&mut self, method: &str, params: Option<&Vec<&Ejson>>, callback: C)
+    pub fn call<C>(&self, method: &str, params: Option<&Vec<&Ejson>>, callback: C)
     where C: FnMut(Result<&Ejson, &Ejson>) + Send + 'static {
-        self.pending_methods.lock().unwrap().send(method, params, callback);
+        self.methods.lock().unwrap().send(method, params, callback);
     }
 
-    pub fn mongo(&mut self, collection: &str) -> MongoCollection {
+    pub fn mongo(&self, collection: &str) -> MongoCollection {
         // TODO: inefficient .get twice, .to_string bad also
         let mut mongos = self.mongos.lock().unwrap();
-        let methods  = self.pending_methods.clone();
+        let methods  = self.methods.clone();
         let callbacks = mongos.get(collection).map(|o| o.clone()).unwrap_or_else(|| {
-            let outgoing = self.outgoing.clone();
             let name = collection.to_string();
-            let handler = Arc::new(Mutex::new(MongoCallbacks::new(outgoing, name)));
+            let handler = Arc::new(Mutex::new(MongoCallbacks::new(self.subs.clone(), name)));
             mongos.insert(collection.to_string(), handler);
             mongos.get(collection).unwrap().clone()
         });

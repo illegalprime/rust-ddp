@@ -9,12 +9,6 @@ use random::Random;
 
 pub struct ListenerId(Listener, u32);
 
-enum SubStatus {
-    NotSubscribed,
-    Subscribed(String),
-    Err(Ejson),
-}
-
 enum Listener {
     Inserted,
     Removed,
@@ -26,30 +20,22 @@ pub struct MongoCallbacks {
     remove_listeners: HashMap<u32, Box<Fn(&str) + Send + 'static>>,
     insert_listeners: HashMap<u32, Box<Fn(&str, Option<&Ejson>) + Send + 'static>>,
     change_listeners: HashMap<u32, Box<Fn(&str, Option<&Ejson>, Option<&Ejson>) + Send + 'static>>,
-    subscribed_listeners: Vec<Box<FnMut(Result<&str, &Ejson>) + Send + 'static>>,
-    ready_listeners:      Vec<Box<FnMut() + Send + 'static>>,
-    outgoing: Arc<Mutex<AtomicSender<String>>>,
-    status:   SubStatus,
-    ready:    bool,
-    count:    u32,
-    name:     String,
-    rng:      Random,
+    subscription:     Arc<Mutex<Subscriptions>>,
+    count:            u32,
+    name:             String,
+    id:               Option<String>,
 }
 
 impl MongoCallbacks {
-    pub fn new(outgoing: Arc<Mutex<AtomicSender<String>>>, name: String) -> MongoCallbacks {
+    pub fn new(subscription: Arc<Mutex<Subscriptions>>, name: String) -> MongoCallbacks {
         MongoCallbacks {
             remove_listeners: HashMap::new(),
             insert_listeners: HashMap::new(),
             change_listeners: HashMap::new(),
-            subscribed_listeners: Vec::new(),
-            ready_listeners:      Vec::new(),
-            status: SubStatus::NotSubscribed,
-            count:  0,
-            ready:  false,
-            name:   name,
-            rng:    Random::new(),
-            outgoing: outgoing,
+            subscription:     subscription,
+            count:            0,
+            name:             name,
+            id:               None,
         }
     }
 
@@ -71,15 +57,12 @@ impl MongoCallbacks {
         ListenerId(Listener::Changed, self.count)
     }
 
-    pub fn add_subscribe<F>(&mut self, f: F) where F: FnMut(Result<&str, &Ejson>) + Send + 'static {
-        if !self.subscribed() {
-            self.subscribed_listeners.push(Box::new(f));
+    pub fn add_ready<F>(&mut self, f: F) where F: FnMut(Result<(), &Ejson>) + Send + 'static {
+        if self.id.is_none() {
+            self.sub();
         }
-    }
-
-    pub fn add_ready<F>(&mut self, f: F) where F: FnMut() + Send + 'static {
-        if !self.ready {
-            self.ready_listeners.push(Box::new(f));
+        if let Some(ref id) = self.id {
+            self.subscription.lock().unwrap().add_listener(id, f);
         }
     }
 
@@ -101,23 +84,6 @@ impl MongoCallbacks {
         }
     }
 
-    pub fn notify_sub(&mut self, status: Result<&str, &Ejson>) {
-        self.status = match status {
-            Ok(id) => SubStatus::Subscribed(id.to_string()),
-            Err(e) => SubStatus::Err(e.clone()),
-        };
-        while let Some(mut callback) = self.subscribed_listeners.pop() {
-            callback(status.clone());
-        }
-    }
-
-    pub fn notify_ready(&mut self) {
-        self.ready = true;
-        while let Some(mut callback) = self.ready_listeners.pop() {
-            callback();
-        }
-    }
-
     pub fn clear_listener(&mut self, id: ListenerId) {
         match id {
             ListenerId(Listener::Inserted, pos) => { self.insert_listeners.remove(&pos); },
@@ -127,60 +93,95 @@ impl MongoCallbacks {
         self.decrement();
     }
 
-    pub fn subscribed(&self) -> bool {
-        match self.status {
-            SubStatus::Subscribed(_) => true,
-            _ => false,
-        }
-    }
-
-    pub fn id(&self) -> Option<&str> {
-        match self.status {
-            SubStatus::Subscribed(ref id) => Some(id as &str),
-            _ => None,
-        }
+    fn sub(&mut self) {
+        self.id = Some(self.subscription.lock().unwrap().sub(&self.name));
     }
 
     fn increment(&mut self) {
         self.count += 1;
-        if self.count == 1 {
+        if self.count == 1 && self.id.is_none() {
             self.sub();
         }
     }
 
     fn decrement(&mut self) {
         self.count -= 1;
-        if self.count == 0 {
-            self.unsub();
+        if self.count == 0 && self.id.is_some() {
+            if let Some(ref id) = self.id {
+                self.subscription.lock().unwrap().unsub(id);
+            }
+        }
+    }
+}
+
+pub struct Subscriptions {
+    outgoing: Arc<Mutex<AtomicSender<String>>>,
+    subs:     HashMap<String, Vec<Box<FnMut(Result<(), &Ejson>) + Send + 'static>>>,
+    rng:      Random,
+}
+
+impl Subscriptions {
+    pub fn new(outgoing: Arc<Mutex<AtomicSender<String>>>) -> Self {
+        Subscriptions {
+            outgoing: outgoing,
+            subs:     HashMap::new(),
+            rng:      Random::new(),
         }
     }
 
-    fn sub(&mut self) {
-        let id = self.rng.id();
-        let subscribe = Subscribe::text(&id, &self.name, None);
-        DdpClient::send(subscribe, &self.outgoing);
+    pub fn notify(&mut self, subs: Result<Vec<&str>, (&str, &Ejson)>) {
+        match subs {
+            Ok(successes) => {
+                for id in successes.iter() {
+                    self.relay(id, Ok(()));
+                }
+            },
+            Err((id, err)) => self.relay(id, Err(err)),
+        };
     }
 
-    fn unsub(&self) {
-        if let Some(ref id) = self.id() {
-            let unsub = Unsubscribe::text(&id);
-            DdpClient::send(unsub, &self.outgoing);
+    pub fn sub(&mut self, name: &str) -> String {
+        let id = self.rng.id();
+        // TODO: Stop cloning:
+        self.subs.insert(id.clone(), Vec::new());
+        // TODO: Use the extra params.
+        let sub_msg = Subscribe::text(&id, &name, None);
+        DdpClient::send(sub_msg, &self.outgoing);
+        id
+    }
+
+    pub fn unsub(&self, id: &str) {
+        let unsub_msg = Unsubscribe::text(id);
+        DdpClient::send(unsub_msg, &self.outgoing);
+    }
+
+    pub fn add_listener<F>(&mut self, id: &str, f: F) where F: FnMut(Result<(), &Ejson>) + Send + 'static {
+        if let Some(mut listeners) = self.subs.get_mut(id) {
+            listeners.push(Box::new(f));
+        }
+    }
+
+    fn relay(&mut self, id: &str, data: Result<(), &Ejson>) {
+        if let Some(mut callbacks) = self.subs.remove(id) {
+            while let Some(mut callback) = callbacks.pop() {
+                callback(data.clone());
+            }
         }
     }
 }
 
 pub struct MongoCollection {
     name: String,
-    methods:   Arc<Mutex<Methods>>,
-    callbacks: Arc<Mutex<MongoCallbacks>>,
+    methods:      Arc<Mutex<Methods>>,
+    callbacks:    Arc<Mutex<MongoCallbacks>>,
 }
 
 impl MongoCollection {
-    pub fn new(collection: String, methods: Arc<Mutex<Methods>>, callbacks: Arc<Mutex<MongoCallbacks>>) -> MongoCollection {
+    pub fn new(collection: String, methods: Arc<Mutex<Methods>>, callbacks: Arc<Mutex<MongoCallbacks>>) -> Self {
         MongoCollection {
-            name: collection,
-            methods: methods,
-            callbacks: callbacks,
+            name:         collection,
+            methods:      methods,
+            callbacks:    callbacks,
         }
     }
 
@@ -196,11 +197,7 @@ impl MongoCollection {
         self.callbacks.lock().unwrap().add_change(f)
     }
 
-    pub fn on_subscribe<F>(&self, f: F) where F: FnMut(Result<&str, &Ejson>) + Send + 'static {
-        self.callbacks.lock().unwrap().add_subscribe(f);
-    }
-
-    pub fn on_ready<F>(&self, f: F) where F: FnMut() + Send + 'static {
+    pub fn on_ready<F>(&self, f: F) where F: FnMut(Result<(), &Ejson>) + Send + 'static {
         self.callbacks.lock().unwrap().add_ready(f);
     }
 
