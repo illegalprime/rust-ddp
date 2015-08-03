@@ -158,7 +158,12 @@ impl DdpClient {
                         let ids = message.get("subs").unwrap().as_array().unwrap();
                         let ids: Vec<&str> = ids.iter().map(|id| id.as_string().unwrap()).collect();
                         message_subs.lock().unwrap().notify(Ok(ids));
-                    }
+                    },
+                    Some("nosub") => {
+                        let id = message.get("id").unwrap().as_string().unwrap();
+                        let error = message.get("error").unwrap();
+                        message_subs.lock().unwrap().notify(Err((id, error)));
+                    },
                     _ => continue,
                 }
             }
@@ -285,13 +290,14 @@ fn test_connect_version() {
     let url = Url::parse("ws://127.0.0.1:3000/websocket").unwrap(); // Get the URL
     let ddp_client_result = DdpClient::new(&url);
 
-    let mut client = match ddp_client_result {
+    let client = match ddp_client_result {
         Ok(client) => client,
         Err(err)   => panic!("An error occured: {:?}", err),
     };
 
     println!("The session id is: {} with DDP v{}", client.session(), client.version());
 
+    println!("\n\nCalling a real method!\n\n");
     client.call("hello", None, |result| {
         print!("Ran method, ");
         match result {
@@ -300,6 +306,7 @@ fn test_connect_version() {
         }
     });
 
+    println!("\n\nCalling a fake method!\n\n");
     client.call("not_a_method", None, |result| {
         print!("Ran method, ");
         match result {
@@ -308,17 +315,33 @@ fn test_connect_version() {
         }
     });
 
+    println!("\n\nSubscribing to MongoColl!\n\n");
     let mongo = client.mongo("MongoColl");
-    mongo.on_add(|id, fields| {
+    mongo.on_add(|id, _| {
         println!("Added record with id: {}", &id);
     });
 
+    println!("\n\nInserting a record!\n\n");
     let record = json::Json::from_str("{ \"first ever meteor data from rust\": true }").unwrap();
     mongo.insert(&record, |result| {
         match result {
-            Err(_) => println!("First every successful insertion into Meteor through rust!"),
-            Ok(_) =>  println!("Damn! Got an error."),
+            Ok(_) => println!("First every successful insertion into Meteor through rust!"),
+            Err(_) =>  println!("Damn! Got an error."),
         };
+    });
+
+    println!("\n\nRemoving records...\n\n");
+    mongo.remove(&record, |result| {
+        println!("removed records {:?}", result);
+    });
+
+    println!("Subscribing to non existent collection.");
+    let nomongo = client.mongo("SomethingElse");
+    nomongo.on_ready(|result| {
+        match result {
+            Ok(()) => unreachable!(),
+            Err(e) => println!("Got an error, this is expected: {}", e),
+        }
     });
 
     client.block_until_err();
