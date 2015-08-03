@@ -1,5 +1,6 @@
 # rust-ddp
 A Rust Library to connect to ddp servers and talk to Meteor servers.
+Actual Docs to come soon.... Hold tight guys.
 
 ## New in v0.0.3
 
@@ -22,8 +23,12 @@ Addition of basic support for MongoCollections!
  - *Inmove*
  - *Resert*
 
-Much less warnings!
+Much less warnings & Better method APIs!
 
-Better method APIs!
+## New in v0.0.1
 
-Actual Docs to come soon.... Hold tight guys.
+ - Support for RPCs
+ - Server/Client Handshake Implementation
+ - Random ID generation
+ - Server Ping supported
+
