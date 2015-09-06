@@ -3,6 +3,7 @@ extern crate log;
 extern crate rustc_serialize;
 extern crate websocket;
 
+use std::borrow::Cow;
 use std::collections::hash_map::HashMap;
 use std::sync::{Arc, Mutex};
 use std::sync::mpsc::channel;
@@ -11,6 +12,8 @@ use std::thread;
 use std::thread::JoinHandle;
 // use rand::Rng;
 use rustc_serialize::json;
+use rustc_serialize::json::Json;
+use rustc_serialize::json::Object;
 use websocket::Message;
 use websocket::client::request::Url;
 use websocket::dataframe::DataFrame;
@@ -37,6 +40,14 @@ pub use collections::ListenerId;
 type Client = websocket::Client<DataFrame, sender::Sender<WebSocketStream>, receiver::Receiver<WebSocketStream>>;
 type MethodCallback = Box<FnMut(Result<&Ejson, &Ejson>) + Send + 'static>;
 
+pub struct OnPanic(Arc<Fn() + Sync + Send>);
+
+impl Drop for OnPanic {
+    fn drop(&mut self) {
+        self.0();
+    }
+}
+
 pub struct Methods {
     outgoing:        Arc<Mutex<AtomicSender<String>>>,
     pending_methods: HashMap<String, MethodCallback>,
@@ -56,7 +67,7 @@ impl Methods {
     where C: FnMut(Result<&Ejson, &Ejson>) + Send + 'static {
         let id = self.rng.id();
         let method = Method::text(&id, method, params);
-        DdpClient::send(method, &self.outgoing);
+        outgoing.lock().unwrap().send(method).unwrap();
         self.pending_methods.insert(id, Box::new(callback));
     }
 
@@ -68,123 +79,233 @@ impl Methods {
     }
 }
 
-pub struct DdpClient {
+trait Reply<'a> {
+    #[inline]
+    fn id(&'a self) -> Option<&'a str> {
+        self.get_ejson("id").and_then(|id| id.as_string())
+    }
+
+    #[inline]
+    fn collection(&'a self) -> Option<&'a str> {
+        self.get_ejson("collection").and_then(|c| c.as_string())
+    }
+
+    #[inline]
+    fn fields(&'a self) -> Option<&'a Ejson> {
+        self.get_ejson("fields")
+    }
+
+    #[inline]
+    fn cleared(&'a self) -> Option<&'a Ejson> {
+        self.get_ejson("cleared")
+    }
+
+    #[inline]
+    fn error(&'a self) -> Option<&'a Ejson> {
+        self.get_ejson("error")
+    }
+
+    #[inline]
+    fn result(&'a self) -> Option<&'a Ejson> {
+        self.get_ejson("result")
+    }
+
+    #[inline]
+    fn subs(&'a self) -> Option<&'a Ejson> {
+        self.get_ejson("subs")
+    }
+
+    fn get_ejson(&'a self, &str) -> Option<&'a Json>;
+}
+
+impl<'a> Reply<'a> for Object {
+    #[inline]
+    fn get_ejson(&'a self, key: &str) -> Option<&'a Ejson> {
+        self.get(key)
+    }
+}
+
+#[derive(Clone)]
+pub struct Core {
     methods:    Arc<Mutex<Methods>>,
     mongos:     Arc<Mutex<HashMap<String, Arc<Mutex<MongoCallbacks>>>>>,
     subs:       Arc<Mutex<Subscriptions>>,
-    session_id: String,
+    transfer:   Arc<Mutex<AtomicSender<String>>>,
+}
+
+impl Core {
+    fn handle_ping(&self, message: &Object) {
+        self.transfer.lock().unwrap().send(Pong::text(message.id())).unwrap();
+    }
+
+    fn handle_result(&self, message: &Object) {
+        if let Some(id) = message.id() {
+            let result = match (message.get("error"), message.get("result")) {
+                (Some(e), None)    => Err(e),
+                (None,    Some(r)) => Ok(r),
+                _                  => return,
+            };
+            self.methods.lock().unwrap().apply(id, result);
+        }
+    }
+
+    fn handle_added(&self, message: &Object) {
+        let collection = self.collection(message);
+        let id = message.id();
+
+        if let (Some(id), Some(mongo)) = (id, collection) {
+            let fields = message.fields();
+            mongo.lock().unwrap().notify_insert(id, fields);
+        }
+    }
+
+    fn handle_changed(&self, message: &Object) {
+        let collection = self.collection(message);
+        let id = message.id();
+
+        if let (Some(id), Some(mongo)) = (id, collection) {
+            let fields = message.fields();
+            let cleared = message.cleared();
+            mongo.lock().unwrap().notify_change(id, fields, cleared);
+        }
+    }
+
+    fn handle_removed(&self, message: &Object) {
+        let collection = self.collection(message);
+        let id = message.id();
+
+        if let (Some(id), Some(mongo)) = (id, collection) {
+            mongo.lock().unwrap().notify_remove(id);
+        }
+    }
+
+    fn handle_ready(&self, message: &Object) {
+        let ids = message.subs().and_then(|s| s.as_array()).and_then(|a| {
+            let idies: Vec<&str> = a.iter()
+                .map(|id| id.as_string())
+                .filter(|o| o.is_some())
+                .map(|s| s.unwrap())
+                .collect();
+            Some(idies)
+        });
+        if let Some(ids) = ids {
+            self.subs.lock().unwrap().notify(Ok(ids));
+        }
+    }
+
+    fn handle_nosub(&self, message: &Object) {
+        let id = message.id();
+        let error = message.error();
+        if let (Some(error), Some(id)) = (error, id) {
+            self.subs.lock().unwrap().notify(Err((id, error)));
+        }
+    }
+
+    #[inline]
+    fn collection(&self, message: &Object) -> Option<&Arc<Mutex<MongoCallbacks>>> {
+        message.collection().and_then(|c| {
+            self.mongos.lock().unwrap().get(c)
+        });
+    }
+}
+
+pub struct Connection<'s> {
+    core:       Core,
     receiver:   JoinHandle<()>,
     sender:     JoinHandle<()>,
+    session_id: String,
     version:    &'static str,
 }
 
-impl DdpClient {
-    pub fn new(url: &Url) -> Result<Self, DdpConnError> {
-        let (client, session_id, v_index) = try!( DdpClient::connect(url) );
+impl<'s> Connection<'s> {
+    pub fn new<F>(url: &Url, on_crash: F) -> Result<Self, DdpConnError>
+    where F: Fn() + Sync + Send + 'static {
+        let (client, session_id, v_index) = try!( Connection::connect(url) );
         let (mut sender, mut receiver) = client.split();
+        let report = Arc::new(on_crash);
+        let (report_sending, report_receiving) = (report.clone(), report);
 
         let (tx, rx) = channel();
-        let tx = Arc::new(Mutex::new(tx));
-        let tx_looper = tx.clone();
-
+        let tx      = Arc::new(Mutex::new(tx));
         let methods = Arc::new(Mutex::new(Methods::new(tx.clone())));
-        let methods_looper = methods.clone();
+        let mongos  = Arc::new(Mutex::new(HashMap::new()));
+        let subs    = Arc::new(Mutex::new(Subscriptions::new(tx.clone())));
 
-        let mongos = Arc::new(Mutex::new(HashMap::new()));
-        let message_mongos = mongos.clone();
+        let core = Core {
+            methods:  methods,
+            mongos:   mongos,
+            subs:     subs,
+            transfer: tx,
+        };
+        let client_core = core.clone();
 
-        let subs = Arc::new(Mutex::new(Subscriptions::new(tx.clone())));
-        let message_subs = subs.clone();
+        let receiving = thread::spawn(move || {
+            OnPanic(report_receiving);
+            let handlers: HashMap<&'static str, &Fn(&Core, &Object)> = HashMap::new();
 
-        let receiver_loop = thread::spawn(move || {
+            handlers.insert("ping",    &Core::handle_ping);
+            handlers.insert("result",  &Core::handle_result);
+            handlers.insert("added",   &Core::handle_added);
+            handlers.insert("changed", &Core::handle_changed);
+            handlers.insert("removed", &Core::handle_removed);
+            handlers.insert("ready",   &Core::handle_ready);
+            handlers.insert("nosub",   &Core::handle_nosub);
+
             for packet in receiver.incoming_messages() {
-                let message_text = match packet {
+                let text = match packet {
                     Ok(Message::Text(m))  => m,
-                    // TODO: Something more meaningful should happen.
                     _ => continue,
                 };
 
-                debug!("<- {}", &message_text);
+                let data = Json::from_str(&text).ok().and_then(|o| o.as_object());
+                let message = data
+                    .and_then(|o| o.get("msg"))
+                    .and_then(|m| m.as_string());
 
-                let message_json = json::Json::from_str(&message_text).unwrap();
-                let message = match message_json.as_object() {
-                    Some(o) => o,
-                    _ => continue,
-                };
-
-                // TODO: Stop assuming received messages are in spec
-                match message.get("msg").unwrap().as_string() {
-                    Some("ping") => {
-                        let id = message.get("id").map(|id| id.as_string().unwrap());
-                        DdpClient::send(Pong::text(id), &tx_looper);
-                    },
-                    Some("result") => {
-                        let id = message.get("id").unwrap().as_string().unwrap();
-                        let response = match (message.get("error"), message.get("result")) {
-                            (Some(e), None)    => Err(e),
-                            (None,    Some(r)) => Ok(r),
-                            _                  => continue,
-                        };
-                        methods_looper.lock().unwrap().apply(id, response);
-                    },
-                    Some("added") => {
-                        let collection = message.get("collection").unwrap().as_string().unwrap();
-                        if let Some(mongo) = message_mongos.lock().unwrap().get(collection) {
-                            let id = message.get("id").unwrap().as_string().unwrap();
-                            let fields = message.get("fields");
-                            let mongo: &Arc<Mutex<MongoCallbacks>> = mongo;
-                            mongo.lock().unwrap().notify_insert(id, fields);
-                        }
-                    },
-                    Some("changed") => {
-                        let collection = message.get("collection").unwrap().as_string().unwrap();
-                        if let Some(mongo) = message_mongos.lock().unwrap().get(collection) {
-                            let id = message.get("id").unwrap().as_string().unwrap();
-                            let fields = message.get("fields");
-                            let cleared = message.get("cleared");
-                            let mongo: &Arc<Mutex<MongoCallbacks>> = mongo;
-                            mongo.lock().unwrap().notify_change(id, fields, cleared);
-                        }
-                    },
-                    Some("removed") => {
-                        let collection = message.get("collection").unwrap().as_string().unwrap();
-                        if let Some(mongo) = message_mongos.lock().unwrap().get(collection) {
-                            let id = message.get("id").unwrap().as_string().unwrap();
-                            let mongo: &Arc<Mutex<MongoCallbacks>> = mongo;
-                            mongo.lock().unwrap().notify_remove(id);
-                        }
-                    },
-                    Some("ready") => {
-                        let ids = message.get("subs").unwrap().as_array().unwrap();
-                        let ids: Vec<&str> = ids.iter().map(|id| id.as_string().unwrap()).collect();
-                        message_subs.lock().unwrap().notify(Ok(ids));
-                    },
-                    Some("nosub") => {
-                        let id = message.get("id").unwrap().as_string().unwrap();
-                        let error = message.get("error").unwrap();
-                        message_subs.lock().unwrap().notify(Err((id, error)));
-                    },
-                    _ => continue,
+                if let (Some(message), Some(data)) = (message, data) {
+                    if let Some(handler) = handlers.get(message) {
+                        handler(&core, data);
+                    }
                 }
             }
         });
 
-        let sender_loop = thread::spawn(move || {
+        let sending = thread::spawn(move || {
+            OnPanic(report_sending);
             while let Ok(message) = rx.recv() {
-                debug!("-> {}", &message);
                 sender.send_message(Message::Text(message)).unwrap();
             }
         });
 
-        Ok(DdpClient {
-            methods:    methods,
-            mongos:     mongos,
-            subs:       subs,
+        Ok(Connection {
+            core:       client_core,
             session_id: session_id,
             version:    VERSIONS[v_index],
-            receiver:   receiver_loop,
-            sender:     sender_loop,
+            receiver:   receiving,
+            sender:     sending,
         })
+    }
+
+    pub fn call<C>(&self, method: &str, params: Option<&Vec<&Ejson>>, callback: C)
+    where C: FnMut(Result<&Ejson, &Ejson>) + Send + 'static {
+        self.core.methods.lock().unwrap().send(method, params, callback);
+    }
+
+    pub fn mongo<S>(&self, collection: S) -> &'s Collection
+    where S: Into<String> {
+        let collection = collection.into();
+        let callbacks = self.core.mongos.lock().unwrap().entry(collection.clone()).or_insert_with(|| {
+            Arc::new(Mutex::new(MongoCallbacks::new(collection, self.core.clone())));
+        });
+        &callbacks
+    }
+
+    pub fn session(&self) -> &str {
+        &self.session_id
+    }
+
+    pub fn version(&self) -> &'static str {
+        &self.version
     }
 
     fn handshake(url: &Url) -> Result<Client, DdpConnError> {
@@ -203,25 +324,33 @@ impl DdpClient {
 
         try!( client.send_message(request).map_err(|e| DdpConnError::Network(e)) );
 
-        for msg_result in client.incoming_messages() {
-            if let Ok(Message::Text(plaintext)) = msg_result {
-                if let Some(success) = Connected::from_response(&plaintext) {
-                    return Ok(NegotiateResp::SessionId(success.session));
-                } else if let Some(failure) = Failed::from_response(&plaintext) {
-                    return Ok(NegotiateResp::Version(failure.version));
+        if let Ok(Message::Text(plaintext)) = client.incoming_messages().next() {
+            if let Some(message) = Json::from_str(plaintext).ok().and_then(|o| o.as_object()) {
+                match message.get("msg") {
+                    Some("success") => {
+                        if let Some(session) = message.get("session").and_then(|v| v.as_string()) {
+                            return Ok(NegotiateResp::SessionId(session));
+                        }
+                    },
+                    Some("failure") => {
+                        if let Some(version) = message.get("version").and_then(|v| v.as_string()) {
+                            return Ok(NegotiateResp::Version(version));
+                        }
+                    }
                 }
             }
         }
-        // TODO: This is probably unreachable
-        Err(DdpConnError::NoVersionFromServer)
+        Err(DdpConnError::MalformedPacket)
     }
 
     fn connect(url: &Url) -> Result<(Client, String, usize), DdpConnError> {
-        let mut client = try!( DdpClient::handshake(url) );
+        let mut client = try!( Connection::handshake(url) );
         let mut v_index = 0;
 
         loop {
-            match DdpClient::negotiate(&mut client, VERSIONS[v_index]) {
+            // TODO: (BUG) Connection gets closed after if versions do not match
+            // we need to open it up again.
+            match Connection::negotiate(&mut client, VERSIONS[v_index]) {
                 Err(e) => return Err(e),
                 Ok(NegotiateResp::SessionId(session)) => return Ok((client, session, v_index)),
                 Ok(NegotiateResp::Version(server_version)) => {
@@ -235,42 +364,6 @@ impl DdpClient {
             };
         }
     }
-
-    pub fn call<C>(&self, method: &str, params: Option<&Vec<&Ejson>>, callback: C)
-    where C: FnMut(Result<&Ejson, &Ejson>) + Send + 'static {
-        self.methods.lock().unwrap().send(method, params, callback);
-    }
-
-    pub fn mongo(&self, collection: &str) -> MongoCollection {
-        // TODO: inefficient .get twice, .to_string bad also
-        let mut mongos = self.mongos.lock().unwrap();
-        let methods  = self.methods.clone();
-        let callbacks = mongos.get(collection).map(|o| o.clone()).unwrap_or_else(|| {
-            let name = collection.to_string();
-            let handler = Arc::new(Mutex::new(MongoCallbacks::new(self.subs.clone(), name)));
-            mongos.insert(collection.to_string(), handler);
-            mongos.get(collection).unwrap().clone()
-        });
-
-        MongoCollection::new(collection.to_string(), methods, callbacks)
-    }
-
-    pub fn block_until_err(self) {
-        self.receiver.join().ok();
-        self.sender.join().ok();
-    }
-
-    pub fn session(&self) -> &str {
-        &self.session_id
-    }
-
-    pub fn version(&self) -> &'static str {
-        &self.version
-    }
-
-    fn send(message: String, tx: &Arc<Mutex<AtomicSender<String>>>) {
-        tx.lock().unwrap().send(message).unwrap();
-    }
 }
 
 pub enum NegotiateResp {
@@ -281,14 +374,14 @@ pub enum NegotiateResp {
 #[derive(Debug)]
 pub enum DdpConnError {
     Network(WebSocketError),
-    NoVersionFromServer,
+    MalformedPacket,
     NoMatchingVersion,
 }
 
 #[test]
 fn test_connect_version() {
     let url = Url::parse("ws://127.0.0.1:3000/websocket").unwrap(); // Get the URL
-    let ddp_client_result = DdpClient::new(&url);
+    let ddp_client_result = Connection::new(&url);
 
     let client = match ddp_client_result {
         Ok(client) => client,
@@ -343,6 +436,4 @@ fn test_connect_version() {
             Err(e) => println!("Got an error, this is expected: {}", e),
         }
     });
-
-    client.block_until_err();
 }
