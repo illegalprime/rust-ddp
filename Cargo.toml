@@ -1,6 +1,6 @@
 [package]
 name = "ddp"
-version = "0.0.3"
+version = "0.0.5"
 description = "A Rust Library to connect to ddp / Meteor servers. Under heavy development, more features to come soon. See repo for more info!"
 repository = "https://github.com/illegalprime/rust-ddp"
 authors = ["Michael Eden <themichaeleden@gmail.com>"]
