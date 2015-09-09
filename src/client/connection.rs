@@ -7,7 +7,6 @@ use std::sync::mpsc::channel;
 use std::sync::mpsc::Sender as AtomicSender;
 use std::thread;
 use std::thread::JoinHandle;
-// use rand::Rng;
 use rustc_serialize::json;
 use rustc_serialize::json::Json;
 use rustc_serialize::json::Object;
@@ -106,14 +105,13 @@ impl Connection {
         }))
     }
 
-    pub fn call<C>(&self, method: &str, params: Option<&Vec<&Ejson>>, callback: C)
-    where C: FnMut(Result<&Ejson, &Ejson>) + Send + 'static {
+    #[inline]
+    pub fn call(&self, method: &str, params: Option<&Vec<&Ejson>>,
+                callback: Box<FnMut(Result<&Ejson, &Ejson>) + Send + 'static>) {
         self.core.methods.lock().unwrap().send(method, params, callback);
     }
 
-    pub fn mongo<S>(&self, collection: S) -> Arc<Collection>
-    where S: Into<String> {
-        let collection = collection.into();
+    pub fn mongo(&self, collection: String) -> Arc<Collection> {
         let mut callbacks = self.core.mongos.lock().unwrap();
         let callbacks = callbacks.entry(collection.clone()).or_insert_with(|| {
             Arc::new(Collection::new(collection, &self.core))
@@ -298,12 +296,12 @@ impl Methods {
         }
     }
 
-    fn send<C>(&mut self, method: &str, params: Option<&Vec<&Ejson>>, callback: C)
-    where C: FnMut(Result<&Ejson, &Ejson>) + Send + 'static {
+    fn send(&mut self, method: &str, params: Option<&Vec<&Ejson>>,
+            callback: Box<FnMut(Result<&Ejson, &Ejson>) + Send + 'static>) {
         let id = self.rng.id();
         let method = Method::text(&id, method, params);
         self.outgoing.lock().unwrap().send(method).unwrap();
-        self.pending_methods.insert(id, Box::new(callback));
+        self.pending_methods.insert(id, callback);
     }
 
     fn apply(&mut self, id: &str, response: Result<&Ejson, &Ejson>) {
@@ -323,10 +321,17 @@ pub struct Collection {
     id:               Arc<Mutex<Option<String>>>,
     count:            Arc<Mutex<u32>>,
     name:             String,
+    ops:              OpNames,
 }
 
 impl Collection {
     fn new(name: String, core: &Core) -> Self {
+        let ops = OpNames {
+            insert: format!("/{}/insert", &name),
+            update: format!("/{}/update", &name),
+            upsert: format!("/{}/upsert", &name),
+            remove: format!("/{}/remove", &name),
+        };
         Collection {
             remove_listeners: Arc::new(Mutex::new(HashMap::new())),
             insert_listeners: Arc::new(Mutex::new(HashMap::new())),
@@ -336,6 +341,7 @@ impl Collection {
             id:               Arc::new(Mutex::new(None)),
             count:            Arc::new(Mutex::new(0)),
             name:             name,
+            ops:              ops,
         }
     }
 
@@ -399,30 +405,22 @@ impl Collection {
 
     pub fn insert<F>(&self, record: &Ejson, callback: F)
     where F: FnMut(Result<&Ejson, &Ejson>) + Send + 'static {
-        // TODO: Stop this mess
-        let method = format!("/{}/insert", self.name);
-        self.methods.lock().unwrap().send(&method, Some(&vec![&record]), callback);
+        self.methods.lock().unwrap().send(&self.ops.insert, Some(&vec![&record]), Box::new(callback));
     }
 
     pub fn update<F>(&self, selector: &Ejson, modifier: &Ejson, callback: F)
     where F: FnMut(Result<&Ejson, &Ejson>) + Send + 'static {
-        // TODO: Stop this mess
-        let method = format!("/{}/update", self.name);
-        self.methods.lock().unwrap().send(&method, Some(&vec![&selector, &modifier]), callback);
+        self.methods.lock().unwrap().send(&self.ops.update, Some(&vec![&selector, &modifier]), Box::new(callback));
     }
 
     pub fn upsert<F>(&self, selector: &Ejson, modifier: &Ejson, callback: F)
     where F: FnMut(Result<&Ejson, &Ejson>) + Send + 'static {
-        // TODO: Stop this mess
-        let method = format!("/{}/upsert", self.name);
-        self.methods.lock().unwrap().send(&method, Some(&vec![&selector, &modifier]), callback);
+        self.methods.lock().unwrap().send(&self.ops.upsert, Some(&vec![&selector, &modifier]), Box::new(callback));
     }
 
     pub fn remove<F>(&self, selector: &Ejson, callback: F)
     where F: FnMut(Result<&Ejson, &Ejson>) + Send + 'static {
-        // TODO: Stop this mess
-        let method = format!("/{}/remove", self.name);
-        self.methods.lock().unwrap().send(&method, Some(&vec![&selector]), callback);
+        self.methods.lock().unwrap().send(&self.ops.remove, Some(&vec![&selector]), Box::new(callback));
     }
 
     pub fn subscribe(&self) {
@@ -558,6 +556,13 @@ pub enum DdpConnError {
     MalformedPacket,
     NoMatchingVersion,
     UrlIsNotWebsocket,
+}
+
+struct OpNames {
+    insert: String,
+    upsert: String,
+    update: String,
+    remove: String,
 }
 
 trait Reply<'a> {

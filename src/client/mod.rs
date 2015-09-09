@@ -10,19 +10,14 @@ pub use self::connection::{Collection, DdpConnError};
 mod messages;
 use self::messages::Ejson;
 
-pub enum Retry {
-    Linear,
-    Exponential,
-    Quadratic,
-    Custom(Box<Fn(u32, u32) -> Option<u32>>),
-}
-
 pub struct Client {
-    url:   Url,
-    retry: Option<Retry>,
-    conn:  Connection,
+    url:    Url,
+    retry:  Option<Retry>,
+    conn:   Connection,
 }
-
+/*
+ * Should Have BlockingClient, QueuedClient, NonblockingClient
+ */
 impl Client {
     pub fn new(url: Url) -> Result<Self, DdpConnError> {
         let (conn, _) = try!(Connection::new(&url, || {
@@ -30,22 +25,22 @@ impl Client {
         }));
 
         Ok(Client {
-            url:   url,
-            retry: None,
-            conn:  conn,
+            url:    url,
+            retry:  None,
+            conn:   conn,
         })
     }
 
     #[inline]
     pub fn call<C>(&self, method: &str, params: Option<&Vec<&Ejson>>, callback: C)
     where C: FnMut(Result<&Ejson, &Ejson>) + Send + 'static {
-        self.conn.call(method, params, callback)
+        self.conn.call(method, params, Box::new(callback))
     }
 
     #[inline]
     pub fn mongo<S>(&self, collection: S) -> Arc<Collection>
     where S: Into<String> {
-        self.conn.mongo(collection)
+        self.conn.mongo(collection.into())
     }
 
     #[inline]
@@ -72,5 +67,15 @@ impl Client {
     }
 }
 
+pub enum Retry {
+    Linear,
+    Exponential,
+    Quadratic,
+    Custom(Box<Fn(u32, u32) -> Option<u32>>),
+}
 
-
+pub enum ClientType {
+    Blocking,
+    Nonblocking,
+    Queueing,
+}
