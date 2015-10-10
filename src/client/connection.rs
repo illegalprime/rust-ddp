@@ -71,7 +71,6 @@ impl Connection {
             handlers.insert("nosub",   Box::new(Core::handle_nosub));
 
             while let Ok(Message::Text(text)) = receiver.recv_message() {
-                println!("-> {}", &text);
                 let decoded = Json::from_str(&text).ok();
                 let data = decoded.as_ref().and_then(|j| j.as_object());
                 let message = data
@@ -89,8 +88,9 @@ impl Connection {
 
         let sending = thread::spawn(move || {
             while let Ok(message) = rx.recv() {
-                println!("<- {}", &message);
-                sender.send_message(Message::Text(message)).unwrap();
+                if sender.send_message(Message::Text(message)).is_err() {
+                    break;
+                }
             }
             rreport.consume();
         });
