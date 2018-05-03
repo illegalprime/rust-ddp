@@ -1,34 +1,35 @@
-use rustc_serialize::json;
 use std::fmt::Display;
 use std::fmt::Formatter;
 use std::fmt::Error as FmtError;
 
+use serde_json;
+
 pub const VERSIONS: &'static [&'static str; 3] = &["1", "pre2", "pre1"];
-pub type Ejson = json::Json;
+pub type Ejson = serde_json::Value;
 
 /***************************
  *        Responses        *
  ***************************/
 
-#[derive(RustcDecodable)]
+#[derive(Deserialize)]
 pub struct Connected {
     pub msg: String,
     pub session: String,
 }
 
-#[derive(RustcDecodable)]
+#[derive(Deserialize)]
 pub struct Failed {
     pub msg: String,
     pub version: String,
 }
 
-#[derive(RustcDecodable)]
+#[derive(Deserialize)]
 pub struct Ping {
     pub msg: String,
     pub id:  Option<String>,
 }
 
-#[derive(RustcDecodable)]
+#[derive(Deserialize)]
 pub struct MethodResult {
     pub msg:    String,
     pub id:     String,
@@ -39,7 +40,7 @@ pub struct MethodResult {
  *        Requests         *
  ***************************/
 
-#[derive(RustcEncodable)]
+#[derive(Serialize)]
 pub struct Connect {
     msg: &'static str,
     version: &'static str,
@@ -54,7 +55,7 @@ pub struct Subscribe;
 
 pub struct Unsubscribe;
 
-pub struct Minify<'a>(&'a Vec<&'a json::Json>);
+pub struct Minify<'a>(&'a Vec<&'a serde_json::Value>);
 
 impl Pong {
     pub fn text<'l>(id: Option<&'l str>) -> String {

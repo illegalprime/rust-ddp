@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
 extern crate websocket;
-use websocket::client::request::Url;
+use websocket::client::Url;
 
 mod connection;
-use self::connection::Connection;
+pub use self::connection::Connection;
 pub use self::connection::{Collection, DdpConnError};
 
 mod messages;

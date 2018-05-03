@@ -1,10 +1,9 @@
-extern crate websocket;
-extern crate rustc_serialize;
+#[macro_use]
+extern crate serde_json;
 extern crate ddp;
 
-use websocket::client::request::Url;
-use rustc_serialize::json;
-use ddp::Connection;
+// use serde_json::json::{self, ToJson};
+use ddp::{Connection, Url};
 
 #[test]
 fn test_connect_version() {
@@ -20,16 +19,22 @@ fn test_connect_version() {
 
     println!("The session id is: {} with DDP v{}", client.session(), client.version());
 
-    handle.stop();
-
-//    println!("\n\nCalling a real method!\n\n");
-//    client.call("hello", None, |result| {
-//        print!("Ran method, ");
-//        match result {
-//            Ok(output) => println!("got a result: {}", output),
-//            Err(error) => println!("got an error: {}", error),
-//        }
-//    });
+    let login_message = json!({
+        "user": {
+            "username": "rc_bot",
+        },
+        "password": "supersecret"
+    });
+    // let json = json::encode(&login_message).unwrap();
+    println!("\n\nCalling a real method!\n\n");
+    client.call("login", Some(&vec![&login_message]), Box::new(|result| {
+        println!("Ran method, login");
+        match result {
+            Ok(output) => println!("got a result: {}", output),
+            Err(error) => println!("got an error: {}", error),
+        }
+    }));
+    handle.join();
 //
 //    println!("\n\nCalling a fake method!\n\n");
 //    client.call("not_a_method", None, |result| {
