@@ -2,7 +2,6 @@
 extern crate serde_json;
 extern crate ddp;
 
-// use serde_json::json::{self, ToJson};
 use ddp::{Connection, Url};
 
 #[test]
