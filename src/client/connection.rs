@@ -1,4 +1,3 @@
-// extern crate rustc_serialize;
 use serde_json;
 extern crate websocket;
 
@@ -13,11 +12,8 @@ use std::thread::JoinHandle;
 use serde_json::Value;
 use websocket::client::Url;
 use websocket::{ClientBuilder, Message};
-use websocket::dataframe::DataFrame;
 use websocket::client::sync::Client;
 use websocket::message::OwnedMessage;
-use websocket::ws::receiver::Receiver;
-use websocket::ws::sender::Sender;
 use websocket::result::WebSocketError;
 
 use super::messages::*;
@@ -69,20 +65,15 @@ impl Connection {
             handlers.insert("ready",   Box::new(Core::handle_ready));
             handlers.insert("nosub",   Box::new(Core::handle_nosub));
 
-            // while let Ok(OwnedMessage::Text(text)) = receiver.recv_message() {
             for message in receiver.incoming_messages() {
                 match message {
                     Ok(OwnedMessage::Text(text)) => {
                         let decoded = serde_json::from_str(&text).ok();
-                        // let data = decoded
-                        // let data = decoded.as_ref().and_then(|j| j.as_object());
                         let message: Option<String> = decoded.as_ref().and_then(|data: &serde_json::Value|
                             data["msg"].as_str().and_then(|s|
                                 Some(s.to_string())
                             )
                         );
-                            // .and_then(|o| o.get("msg"))
-                            // .and_then(|m| m.as_str());
 
                         if let (Some(message), Some(data)) = (message, decoded) {
                             if let Some(handler) = handlers.get(&message[..]) {
