@@ -1,30 +1,35 @@
-extern crate rustc_serialize;
+// extern crate rustc_serialize;
+use serde_json;
 extern crate websocket;
 
 use std::collections::hash_map::HashMap;
+use std::io;
+use std::net::TcpStream;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::sync::mpsc::channel;
 use std::sync::mpsc::Sender as AtomicSender;
 use std::thread;
 use std::thread::JoinHandle;
-use rustc_serialize::json;
-use rustc_serialize::json::Json;
-use rustc_serialize::json::Object;
-use websocket::Message;
-use websocket::client::request::Url;
+use serde_json::Value;
+// use rustc_serialize::json;
+// use rustc_serialize::json::Json;
+// use rustc_serialize::json::Object;
+use websocket::client::Url;
+use websocket::{ClientBuilder, Message};
 use websocket::dataframe::DataFrame;
-use websocket::client::sender;
-use websocket::client::receiver;
+use websocket::client::sync::Client;
+use websocket::message::OwnedMessage;
+// use websocket::client::sync::Sender;
+// use websocket::client::sync::Receiver;
 use websocket::ws::receiver::Receiver;
 use websocket::ws::sender::Sender;
-use websocket::stream::WebSocketStream;
+// use websocket::stream::WebSocketStream;
 use websocket::result::WebSocketError;
 
 use super::messages::*;
 
 use random::Random;
 
-type Client = websocket::Client<DataFrame, sender::Sender<WebSocketStream>, receiver::Receiver<WebSocketStream>>;
 type MethodCallback = Box<FnMut(Result<&Ejson, &Ejson>) + Send + 'static>;
 type MongoLock<'s> = MutexGuard<'s, HashMap<String, Arc<Collection>>>;
 
@@ -37,11 +42,11 @@ pub struct Connection {
 impl Connection {
     pub fn new<F>(url: &Url, on_crash: F) -> Result<(Self, ConnectionHandle), DdpConnError>
     where F: Fn() + Sync + Send + 'static {
-        if url.scheme != WS && url.scheme != WSS {
+        if url.scheme() != WS && url.scheme() != WSS {
             return Err(DdpConnError::UrlIsNotWebsocket);
         }
-        let (client, session_id, v_index) = try!( Connection::connect(url) );
-        let (mut sender, mut receiver) = client.split();
+        let (client, session_id, v_index) = Connection::connect(url)?;
+        let ( mut receiver, mut sender) = client.split().map_err(|e| DdpConnError::IoError(e))?;
         let sreport = Arc::new(OnDrop(Arc::new(on_crash)));
         let rreport = sreport.clone();
 
@@ -60,7 +65,7 @@ impl Connection {
         let client_core = core.clone();
 
         let receiving = thread::spawn(move || {
-            let mut handlers: HashMap<&'static str, Box<Fn(&Core, &Object)>> = HashMap::new();
+            let mut handlers: HashMap<&'static str, Box<Fn(&Core, &Value)>> = HashMap::new();
 
             handlers.insert("ping",    Box::new(Core::handle_ping));
             handlers.insert("result",  Box::new(Core::handle_result));
@@ -70,17 +75,27 @@ impl Connection {
             handlers.insert("ready",   Box::new(Core::handle_ready));
             handlers.insert("nosub",   Box::new(Core::handle_nosub));
 
-            while let Ok(Message::Text(text)) = receiver.recv_message() {
-                let decoded = Json::from_str(&text).ok();
-                let data = decoded.as_ref().and_then(|j| j.as_object());
-                let message = data
-                    .and_then(|o| o.get("msg"))
-                    .and_then(|m| m.as_string());
+            // while let Ok(OwnedMessage::Text(text)) = receiver.recv_message() {
+            for message in receiver.incoming_messages() {
+                match message {
+                    Ok(OwnedMessage::Text(text)) => {
+                        let decoded = serde_json::from_str(&text).ok();
+                        // let data = decoded
+                        // let data = decoded.as_ref().and_then(|j| j.as_object());
+                        let message: Option<String> = decoded.as_ref().and_then(|data: &serde_json::Value|
+                            data["msg"].as_str().and_then(|s|
+                                Some(s.to_string())
+                            )
+                        );
+                            // .and_then(|o| o.get("msg"))
+                            // .and_then(|m| m.as_str());
 
-                if let (Some(message), Some(data)) = (message, data) {
-                    if let Some(handler) = handlers.get(message) {
-                        handler(&core, data);
-                    }
+                        if let (Some(message), Some(data)) = (message, decoded) {
+                            if let Some(handler) = handlers.get(&message[..]) {
+                                handler(&core, &data);
+                            }
+                        }},
+                    _ => break
                 }
             }
             sreport.consume();
@@ -88,7 +103,7 @@ impl Connection {
 
         let sending = thread::spawn(move || {
             while let Ok(message) = rx.recv() {
-                if sender.send_message(Message::Text(message)).is_err() {
+                if sender.send_message(&Message::text(message)).is_err() {
                     break;
                 }
             }
@@ -127,38 +142,35 @@ impl Connection {
         &self.version
     }
 
-    fn handshake(url: &Url) -> Result<Client, DdpConnError> {
+    fn handshake(url: &Url) -> Result<Client<TcpStream>, DdpConnError> {
         // Handshake with the server
-        let knock  = try!( Client::connect(url).map_err(|e| DdpConnError::Network(e)) );
-        let answer = try!( knock.send()        .map_err(|e| DdpConnError::Network(e)) );
-        try!( answer.validate()                .map_err(|e| DdpConnError::Network(e)) );
-
-        // Get referennce to the client
-        Ok(answer.begin())
+        Ok(ClientBuilder::new(&url.to_string())
+            .map_err(|e| DdpConnError::Parse(e))?
+            .connect_insecure().map_err(|e| DdpConnError::Network(e) )?)
     }
 
-    fn negotiate(client: &mut Client, version: &'static str) -> Result<NegotiateResp, DdpConnError> {
+    fn negotiate(client: &mut Client<TcpStream>, version: &'static str) -> Result<NegotiateResp, DdpConnError> {
         let request = Connect::new(version);
-        let request = Message::Text(json::encode(&request).unwrap());
+        let request = Message::text(serde_json::to_string(&request).unwrap());
 
-        try!( client.send_message(request).map_err(|e| DdpConnError::Network(e)) );
+        try!( client.send_message(&request).map_err(|e| DdpConnError::Network(e)) );
 
-        while let Ok(Message::Text(plaintext)) = client.recv_message() {
-            let decoded = Json::from_str(&plaintext).ok();
-            if let Some(message) = decoded.as_ref().and_then(|o| o.as_object()) {
+        while let Ok(OwnedMessage::Text(plaintext)) = client.recv_message() {
+            let decoded: Option<serde_json::Value> = serde_json::from_str(&plaintext).ok();
+            if let Some(message) = decoded {
                 if message.get("server_id").is_some() {
                     // DDP: Old API that will be deprecated and is not supported here.
                     continue;
                 }
-                match message.get("msg").and_then(|m| m.as_string()) {
+                match message.get("msg").and_then(|m| m.as_str()) {
                     Some("connected") => {
-                        if let Some(session) = message.get("session").and_then(|v| v.as_string()) {
+                        if let Some(session) = message.get("session").and_then(|v| v.as_str()) {
                             // TODO: Avoidable to_string?
                             return Ok(NegotiateResp::SessionId(session.to_string()));
                         }
                     },
                     Some("failed") => {
-                        if let Some(version) = message.get("version").and_then(|v| v.as_string()) {
+                        if let Some(version) = message.get("version").and_then(|v| v.as_str()) {
                             // TODO: Avoidable to_string?
                             return Ok(NegotiateResp::Version(version.to_string()));
                         }
@@ -173,7 +185,7 @@ impl Connection {
         Err(DdpConnError::MalformedPacket)
     }
 
-    fn connect(url: &Url) -> Result<(Client, String, usize), DdpConnError> {
+    fn connect(url: &Url) -> Result<(Client<TcpStream>, String, usize), DdpConnError> {
         let mut v_index = 0;
 
         loop {
@@ -203,11 +215,11 @@ struct Core {
 }
 
 impl Core {
-    fn handle_ping(&self, message: &Object) {
+    fn handle_ping(&self, message: &Value) {
         self.transfer.lock().unwrap().send(Pong::text(message.id())).unwrap();
     }
 
-    fn handle_result(&self, message: &Object) {
+    fn handle_result(&self, message: &Value) {
         if let Some(ref id) = message.id() {
             let result = match (message.get("error"), message.get("result")) {
                 (Some(e), None)    => Err(e),
@@ -218,7 +230,7 @@ impl Core {
         }
     }
 
-    fn handle_added(&self, message: &Object) {
+    fn handle_added(&self, message: &Value) {
         let lock = self.mongos.lock().unwrap();
         let collection = self.collection(&lock, message);
         let id = message.id();
@@ -229,7 +241,7 @@ impl Core {
         }
     }
 
-    fn handle_changed(&self, message: &Object) {
+    fn handle_changed(&self, message: &Value) {
         let lock = self.mongos.lock().unwrap();
         let collection = self.collection(&lock, message);
         let id = message.id();
@@ -241,7 +253,7 @@ impl Core {
         }
     }
 
-    fn handle_removed(&self, message: &Object) {
+    fn handle_removed(&self, message: &Value) {
         let lock = self.mongos.lock().unwrap();
         let collection = self.collection(&lock, message);
         let id = message.id();
@@ -251,10 +263,10 @@ impl Core {
         }
     }
 
-    fn handle_ready(&self, message: &Object) {
+    fn handle_ready(&self, message: &Value) {
         let ids = message.subs().and_then(|s| s.as_array()).and_then(|a| {
             let idies: Vec<&str> = a.iter()
-                .map(|id| id.as_string())
+                .map(|id| id.as_str())
                 .filter(|o| o.is_some())
                 .map(|s| s.unwrap())
                 .collect();
@@ -265,7 +277,7 @@ impl Core {
         }
     }
 
-    fn handle_nosub(&self, message: &Object) {
+    fn handle_nosub(&self, message: &Value) {
         let id = message.id();
         let error = message.error();
         if let (Some(error), Some(id)) = (error, id) {
@@ -274,7 +286,7 @@ impl Core {
     }
 
     #[inline]
-    fn collection<'a>(&'a self, lock: &'a MongoLock, message: &Object) -> Option<&Arc<Collection>> {
+    fn collection<'a>(&'a self, lock: &'a MongoLock, message: &Value) -> Option<&Arc<Collection>> {
         message.collection().and_then(|c| {
             lock.get(c)
         })
@@ -556,6 +568,8 @@ pub enum DdpConnError {
     MalformedPacket,
     NoMatchingVersion,
     UrlIsNotWebsocket,
+    IoError(io::Error),
+    Parse(websocket::client::ParseError),
 }
 
 struct OpNames {
@@ -568,12 +582,12 @@ struct OpNames {
 trait Reply<'a> {
     #[inline]
     fn id(&'a self) -> Option<&'a str> {
-        self.get_ejson("id").and_then(|id| id.as_string())
+        self.get_ejson("id").and_then(|id| id.as_str())
     }
 
     #[inline]
     fn collection(&'a self) -> Option<&'a str> {
-        self.get_ejson("collection").and_then(|c| c.as_string())
+        self.get_ejson("collection").and_then(|c| c.as_str())
     }
 
     #[inline]
@@ -601,10 +615,10 @@ trait Reply<'a> {
         self.get_ejson("subs")
     }
 
-    fn get_ejson(&'a self, &str) -> Option<&'a Json>;
+    fn get_ejson(&'a self, &str) -> Option<&'a Ejson>;
 }
 
-impl<'a> Reply<'a> for Object {
+impl<'a> Reply<'a> for Value {
     #[inline]
     fn get_ejson(&'a self, key: &str) -> Option<&'a Ejson> {
         self.get(key)
