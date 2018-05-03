@@ -1,4 +1,4 @@
-#[macro_use]
+// #[macro_use] 
 extern crate log;
 extern crate websocket;
 #[macro_use] extern crate serde_derive;

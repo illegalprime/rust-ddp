@@ -11,7 +11,7 @@ mod messages;
 use self::messages::Ejson;
 
 pub struct Client {
-    url:    Url,
+    // url:    Url,
     retry:  Option<Retry>,
     conn:   Connection,
 }
@@ -25,7 +25,7 @@ impl Client {
         }));
 
         Ok(Client {
-            url:    url,
+            // url:    url,
             retry:  None,
             conn:   conn,
         })
